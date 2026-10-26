@@ -159,8 +159,15 @@ sudo sh deploy/install.sh        # ставит службу, создаёт в�
 
 ## Лицензия
 
-MIT — см. [LICENSE](LICENSE). Шрифты в `server/static/fonts/` (Golos Text, JetBrains Mono, Unbounded) —
-SIL Open Font License 1.1, см. [OFL.txt](server/static/fonts/OFL.txt).
+GNU AGPL v3 или новее, полный текст — в [LICENSE](LICENSE). Copyright (C) 2026 ArtYudin89.
+
+Условие простое: берёте код — открывайте свой. AGPL, а не GPL, потому что Пульт — сервер: если вы
+изменили его и даёте им пользоваться другим людям по сети, исходники изменённой версии нужно открыть
+и им. Своя установка без изменений ничего не требует. Версии до 26.10.2026 (коммиты 21f7ae1–1bfe770)
+вышли под MIT и у тех, кто их скачал, под MIT и остаются.
+
+Шрифты в `server/static/fonts/` (Golos Text, JetBrains Mono, Unbounded) — SIL Open Font License 1.1,
+см. [OFL.txt](server/static/fonts/OFL.txt); лицензия Пульта на них не распространяется.
 
 ## Поддержать
 
