@@ -1,0 +1,52 @@
+[Unit]
+Description=Pult - work board for people and AI agents (:@PORT@)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pult
+Group=pult
+ExecStart=/usr/bin/python3 /opt/pult/pult_server.py serve --db /var/lib/pult/pult.db --static /opt/pult/static --port @PORT@ --backup-dir /var/lib/pult/backup@PLAIN@
+# Сертификат и ключ systemd отдаёт копией в $CREDENTIALS_DIRECTORY, поэтому служба не стартует от root
+# и сами файлы ей не видны. Без сертификата (PULT_CERT пуст) служба слушает только 127.0.0.1 без TLS
+# с ключом --proxy: наружу её отдаёт обратный прокси с HTTPS.
+@TLS@LoadCredential=cert:@CERT@
+@TLS@LoadCredential=key:@KEY@
+Restart=always
+RestartSec=3
+# Перезапуск раз в 12 ч подхватывает продлённый сертификат; входы на страницах не теряются.
+RuntimeMaxSec=43200
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+
+# Пульт занимает около 15 МБ: граница тесная намеренно, чтобы влезать на самый маленький сервер.
+MemoryHigh=48M
+MemoryMax=80M
+TasksMax=48
+CPUWeight=20
+
+StateDirectory=pult
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

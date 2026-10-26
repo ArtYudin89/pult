@@ -1,0 +1,327 @@
+# -*- coding: utf-8 -*-
+"""Страница на копии боевой базы в настоящем Chrome (Playwright, channel="chrome"): доска — перенос мышью и
+пальцем, фильтры, поиск; вложения — выбор файла, Ctrl+V, перетаскивание на карточку, удаление; телефон 400 px;
+тёмная тема. Снимки — в <папку>: смотреть глазами, строки OK про вид ничего не говорят.
+
+    python -X utf8 tests/ui_check.py <копия базы.db> server/pult_server.py server/static <папка для снимков>
+
+Свежая копия базы — как в docs/install.md («Обновление»). Ждать через wait_for_url/wait_for_selector:
+wait_for_function со строкой страница не пропустит — в её CSP нет 'unsafe-eval'.
+"""
+import contextlib
+import hashlib
+import json
+import os
+import shutil
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import zlib
+
+from playwright.sync_api import sync_playwright
+
+
+def pick_actor(db_path, prefer):
+    """Кого проверять: PULT_CHECK_ACTOR или первый владелец в копии базы (prefer — model или person)."""
+    if os.environ.get("PULT_CHECK_ACTOR"):
+        return os.environ["PULT_CHECK_ACTOR"]
+    with contextlib.closing(sqlite3.connect(db_path)) as c:
+        return c.execute("SELECT id FROM actors WHERE role = 'owner' ORDER BY kind = ? DESC, id",
+                         (prefer,)).fetchone()[0]
+
+src, server, static, out = sys.argv[1:5]
+os.makedirs(out, exist_ok=True)
+tmp = tempfile.mkdtemp(prefix="pult_ui3_")
+db = os.path.join(tmp, "ui.db")
+shutil.copyfile(src, db)
+KEY = "ui3-owner-" + "w" * 40
+with contextlib.closing(sqlite3.connect(db)) as c:
+    c.execute("INSERT INTO keys(hash, actor_id, label, created_at) VALUES (?, ?, 'ui-test', '2026-10-26T00:00:00+03:00')",
+              (hashlib.sha256(KEY.encode()).hexdigest(), pick_actor(db, "person")))
+    c.commit()
+with socket.socket() as s:
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+base = f"http://127.0.0.1:{port}"
+proc = subprocess.Popen([sys.executable, "-X", "utf8", server, "serve", "--db", db, "--static", static,
+                         "--host", "127.0.0.1", "--port", str(port), "--plain-http"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+for _ in range(100):
+    with contextlib.suppress(OSError), socket.create_connection(("127.0.0.1", port), timeout=0.2):
+        break
+    time.sleep(0.1)
+
+
+def png(w, h, rgb):
+    raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+    chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))  # noqa: E731
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + \
+        chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+PNG_PATH = os.path.join(tmp, "Схема доски.png")
+with open(PNG_PATH, "wb") as f:
+    f.write(png(320, 200, (46, 78, 208)))
+TXT_PATH = os.path.join(tmp, "crash.log")
+with open(TXT_PATH, "wb") as f:
+    f.write("Ошибка доступа\r\n".encode("cp1251"))
+
+
+def call(method, path, body=None):
+    req = urllib.request.Request(base + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"})
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req) as r:
+        return json.loads(r.read().decode())
+
+
+notes, errors = [], []
+
+
+def check(cond, what):
+    notes.append(("OK  " if cond else "FAIL") + " " + what)
+    return cond
+
+
+def watch(page, who):
+    page.on("console", lambda m: errors.append(f"{who} console {m.type}: {m.text}") if m.type in ("error", "warning") else None)
+    page.on("pageerror", lambda e: errors.append(f"{who} pageerror: {e}"))
+
+
+def task(key):
+    return call("GET", "/api/task/" + key)["task"]
+
+
+def center(box):
+    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+
+try:
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(channel="chrome", headless=True)
+        ctx = browser.new_context(viewport={"width": 1440, "height": 900}, locale="ru-RU")
+        page = ctx.new_page()
+        watch(page, "desk")
+        page.goto(base + "/login#k=" + KEY)
+        page.wait_for_url(base + "/#all")
+        page.wait_for_selector(".trow")
+
+        # ---------- доска ----------
+        page.click('[data-nav="board"]')
+        page.wait_for_selector(".bcol")
+        check(page.url.endswith("#board"), f"пункт «Доска» слева ведёт на #board ({page.url[-12:]})")
+        check(page.locator(".bcol").count() == 5, "пять колонок")
+        check("wide" in (page.get_attribute("#main", "class") or ""), "доска во всю ширину")
+        st = call("GET", "/api/state")
+        open_by = {k: sum(1 for t in st["tasks"] if t["status"] == k) for k in ("inbox", "next", "doing", "wait")}
+        shown = {k: page.locator(f'.bcol[data-col="{k}"] .bcard').count() for k in open_by}
+        check(shown == open_by, f"в колонках все открытые задачи: {shown}")
+        page.screenshot(path=os.path.join(out, "01_board.png"))
+
+        # мышью: первая карточка «Входящих» → «В работе»
+        card = page.locator('.bcol[data-col="inbox"] .bcard').first
+        key = card.get_attribute("data-task")
+        x0, y0 = center(card.bounding_box())
+        x1, y1 = center(page.locator('.bcol[data-col="doing"] .bhead').bounding_box())
+        page.mouse.move(x0, y0)
+        page.mouse.down()
+        page.mouse.move(x0 + 20, y0 + 5, steps=3)
+        check(page.locator(".bghost").count() == 1, "мышь: карточка поднялась после сдвига")
+        page.mouse.move(x1, y1 + 40, steps=12)
+        check(page.locator('.bcol[data-col="doing"].over').count() == 1, "мышь: колонка под курсором подсвечена")
+        page.screenshot(path=os.path.join(out, "02_dragging.png"))
+        page.mouse.up()
+        page.wait_for_selector(".toast:not([hidden])")
+        check(task(key)["status"] == "doing", f"мышь: {key} перенесена в «В работе»")
+        check(page.locator('.bcol[data-col="doing"] .bcard[data-task="' + key + '"]').count() == 1, "мышь: карточка в новой колонке")
+        check(page.locator("#drawer").is_hidden(), "после переноса карточка задачи не открылась")
+        j = call("GET", "/api/task/" + key)["journal"][0]
+        check("Статус: Входящие → В работе" in " ".join(j["changes"]), "журнал: смена статуса записана")
+
+        # в «Ждёт» без записанного ожидания → форма с полем «Ждём»
+        nxt = [t for t in st["tasks"] if t["status"] == "next" and not t["wait"]]
+        k2 = nxt[0]["key"]
+        c2 = page.locator(f'.bcard[data-task="{k2}"]')
+        c2.scroll_into_view_if_needed()
+        x0, y0 = center(c2.bounding_box())
+        x1 = center(page.locator('.bcol[data-col="wait"]').bounding_box())[0]
+        page.mouse.move(x0, y0)
+        page.mouse.down()
+        page.mouse.move(x1, y0, steps=15)
+        page.mouse.up()
+        page.wait_for_selector('#drawer form[data-form="edit"]')
+        focused = page.evaluate("document.activeElement && document.activeElement.name")
+        check(focused == "wait" and task(k2)["status"] == "wait", f"в «Ждёт»: статус сменён, открыта форма, фокус на «Ждём» ({focused})")
+        page.screenshot(path=os.path.join(out, "03_wait_form.png"))
+        page.keyboard.press("Escape")
+        page.keyboard.press("Escape")
+        page.wait_for_selector("#drawer", state="hidden")
+
+        # обычный щелчок открывает карточку
+        page.locator('.bcol[data-col="doing"] .bcard').first.click()
+        page.wait_for_selector("#drawer .fields")
+        check("#board" in page.url and "&t=" in page.url, "щелчок по карточке открывает задачу поверх доски")
+        page.keyboard.press("Escape")
+        page.wait_for_selector("#drawer", state="hidden")
+
+        # фильтры
+        page.select_option("select[data-bscope]", "p:lab")
+        page.wait_for_url(base + "/#board=p:lab")
+        lab = sum(1 for t in st["tasks"] if t["project"] == "lab" and t["status"] in open_by)
+        check(page.locator(".bcard:not(.closed)").count() == lab and page.locator(".bc-p").count() == 0,
+              f"фильтр «sr-lab»: {lab} открытых, без подписи проекта")
+        page.select_option("select[data-bscope]", "")
+        page.select_option("select[data-bwho]", "me")
+        mine = page.locator(".bcard").count()
+        check(mine > 0 and all(page.locator(".bcard .av").nth(i).get_attribute("title").startswith("Артём")
+                               for i in range(mine)), f"фильтр «Держу я»: {mine} карточек, все у Артёма")
+        page.select_option("select[data-bwho]", "")
+        page.fill("#q", "эльтан")
+        page.wait_for_selector(".qbar")
+        found = page.locator(".bcard").count()
+        check(0 < found < 20 and page.locator(".bcard mark").count() > 0, f"поиск по доске: {found} карточек, совпадения подсвечены")
+        page.fill("#q", "")
+        page.goto(base + "/#p=lab")
+        page.wait_for_selector('[data-board="p:lab"]')
+        page.click('[data-board="p:lab"]')
+        page.wait_for_url(base + "/#board=p:lab")
+        check(True, "кнопка «Доской» в проекте ведёт на доску проекта")
+
+        # ---------- вложения ----------
+        page.goto(base + "/#t=INF-30")
+        page.wait_for_selector("#drawer [data-attach]")
+        page.set_input_files("#file-input", [PNG_PATH, TXT_PATH])
+        page.wait_for_selector("#drawer .thumb img")
+        page.wait_for_selector("#drawer .flist li")
+        nw = 0
+        for _ in range(50):
+            nw = page.evaluate("() => { const i = document.querySelector('#drawer .thumb img'); return i ? i.naturalWidth : 0; }")
+            if nw == 320:
+                break
+            time.sleep(0.1)
+        check(nw == 320, f"картинка прикреплена и показана, CSP не мешает (ширина {nw})")
+        files = call("GET", "/api/task/INF-30")["files"]
+        check([f["name"] for f in files] == ["Схема доски.png", "crash.log"], f"на сервере: {[f['name'] for f in files]}")
+        page.locator("#drawer").screenshot(path=os.path.join(out, "04_card_files.png"))
+        resp = page.request.get(base + f"/api/file/{files[1]['id']}?dl=1")
+        check(resp.headers.get("content-disposition", "").startswith("attachment") and resp.body() == open(TXT_PATH, "rb").read(),
+              "лог отдаётся на скачивание, байты целы (cp1251)")
+        # удалить лог: два нажатия
+        page.click("#drawer .flist [data-fdel]")
+        check(page.locator("#drawer .flist [data-fdel]").inner_text() == "Точно?", "удаление спрашивает подтверждение")
+        page.click("#drawer .flist [data-fdel]")
+        page.wait_for_selector("#drawer .flist", state="detached")
+        check(len(call("GET", "/api/task/INF-30")["files"]) == 1, "лог удалён")
+        # вставка скриншота из буфера
+        page.evaluate("""() => { const b = new Uint8Array([137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82]);
+            const dt = new DataTransfer(); dt.items.add(new File([b], 'image.png', {type: 'image/png'}));
+            document.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true})); }""")
+        page.wait_for_selector("#drawer .thumb >> nth=1")
+        names = [f["name"] for f in call("GET", "/api/task/INF-30")["files"]]
+        check(names[-1].startswith("скриншот ") and names[-1].endswith(".png"), f"Ctrl+V: скриншот с датой в имени ({names[-1]})")
+        # файл, брошенный на карточку
+        dt = page.evaluate_handle("() => { const d = new DataTransfer(); d.items.add(new File(['hello'], 'бросил.txt', {type: 'text/plain'})); return d; }")
+        page.dispatch_event("#drawer", "dragenter", {"dataTransfer": dt})
+        check("dropping" in (page.get_attribute("#drawer", "class") or ""), "перетаскивание файла подсвечивает карточку")
+        page.dispatch_event("#drawer", "drop", {"dataTransfer": dt})
+        page.wait_for_selector("#drawer .flist li")
+        check("бросил.txt" in page.locator("#drawer .flist").inner_text(), "файл, брошенный на карточку, прикреплён")
+        jr = page.locator("#drawer .journal").inner_text()
+        check("Вложение: Схема доски.png" in jr and "Вложение удалено: crash.log" in jr, "журнал карточки: вложения записаны")
+        page.locator("#drawer").screenshot(path=os.path.join(out, "05_card_files_after.png"))
+        page.keyboard.press("Escape")
+        page.goto(base + "/#all")
+        page.fill("#q", "INF-30")
+        page.wait_for_selector(".qbar")
+        check("3 вложения" in page.locator(".trow").first.inner_text(), "в списке: «3 вложения» у задачи")
+        page.fill("#q", "")
+        page.goto(base + "/#board")
+        page.wait_for_selector(".bcol")
+        bc = page.locator('.bcard[data-task="INF-30"]')
+        check(bc.count() == 1 and "3" in bc.locator(".bc-foot").inner_text(), "на доске: скрепка с числом вложений")
+
+        # ---------- тёмная тема ----------
+        dark = browser.new_context(viewport={"width": 1440, "height": 900}, locale="ru-RU", color_scheme="dark")
+        dp = dark.new_page()
+        watch(dp, "dark")
+        dp.goto(base + "/login#k=" + KEY)
+        dp.wait_for_url(base + "/#all")
+        dp.goto(base + "/#board")
+        dp.wait_for_selector(".bcol")
+        dp.screenshot(path=os.path.join(out, "06_board_dark.png"))
+        dp.goto(base + "/#board&t=INF-30")
+        dp.wait_for_selector("#drawer .thumb img")
+        dp.wait_for_timeout(300)
+        dp.screenshot(path=os.path.join(out, "07_card_dark.png"))
+
+        # ---------- телефон ----------
+        phone = browser.new_context(viewport={"width": 400, "height": 860}, locale="ru-RU", device_scale_factor=2,
+                                    is_mobile=True, has_touch=True)
+        pp = phone.new_page()
+        watch(pp, "phone")
+        pp.goto(base + "/login#k=" + KEY)
+        pp.wait_for_url(base + "/#all")
+        pp.goto(base + "/#board")
+        pp.wait_for_selector(".bcol")
+        w = pp.evaluate("document.documentElement.scrollWidth")
+        bw = pp.evaluate("[document.getElementById('board').scrollWidth, document.getElementById('board').clientWidth]")
+        check(w <= 400 and bw[0] > bw[1], f"телефон: страница без сдвига вбок ({w}px), колонки листаются внутри доски {bw}")
+        check(pp.locator(".touch-only").first.is_visible(), "телефон: подсказка про долгое нажатие видна")
+        pp.screenshot(path=os.path.join(out, "08_phone_board.png"))
+        cdp = phone.new_cdp_session(pp)
+
+        def touch(kind, x=None, y=None):
+            cdp.send("Input.dispatchTouchEvent", {"type": kind, "touchPoints": [] if x is None else [{"x": x, "y": y}]})
+
+        # короткое движение пальцем — прокрутка, а не перенос
+        first = pp.locator('.bcol[data-col="inbox"] .bcard').first
+        k3 = first.get_attribute("data-task")
+        x0, y0 = center(first.bounding_box())
+        before = pp.evaluate("document.getElementById('board').scrollLeft")
+        touch("touchStart", x0, y0)
+        for i in range(1, 9):
+            touch("touchMove", x0 - i * 25, y0)
+            pp.wait_for_timeout(16)
+        touch("touchEnd")
+        pp.wait_for_timeout(400)
+        after = pp.evaluate("document.getElementById('board').scrollLeft")
+        check(task(k3)["status"] == "inbox" and pp.locator(".bghost").count() == 0,
+              f"телефон: быстрый свайп не переносит карточку (прокрутка {before}→{after})")
+        pp.evaluate("document.getElementById('board').scrollLeft = 0")
+        pp.wait_for_timeout(300)
+        # долгое нажатие и перенос в соседнюю колонку
+        x0, y0 = center(first.bounding_box())
+        touch("touchStart", x0, y0)
+        pp.wait_for_timeout(600)
+        lifted = pp.locator(".bghost").count() == 1
+        for i in range(1, 13):
+            touch("touchMove", x0 + i * 15, y0 + i * 2)
+            pp.wait_for_timeout(30)
+        target = pp.evaluate("(document.querySelector('.bcol.over') || {}).dataset ? document.querySelector('.bcol.over').dataset.col : null")
+        pp.screenshot(path=os.path.join(out, "09_phone_dragging.png"))
+        touch("touchEnd")
+        pp.wait_for_timeout(800)
+        st3 = task(k3)["status"]
+        check(lifted and target not in (None, "inbox") and st3 == target,
+              f"телефон: долгое нажатие поднимает карточку, перенос в «{target}» → статус {st3}")
+        pp.goto(base + "/#t=INF-30")
+        pp.wait_for_selector("#drawer .thumb img")
+        dw = pp.evaluate("document.getElementById('drawer').scrollWidth")
+        check(dw <= 400, f"телефон: карточка с вложениями по ширине ({dw}px)")
+        pp.locator("#drawer [data-attach]").scroll_into_view_if_needed()
+        pp.screenshot(path=os.path.join(out, "10_phone_card_files.png"))
+        browser.close()
+finally:
+    proc.terminate()
+    proc.wait(10)
+    err = proc.stderr.read().decode("utf-8", "replace")
+    proc.stderr.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("\n".join(notes))
+    print("console/page errors:", errors or "нет")
+    print("server stderr:", err.strip()[-2000:] or "пусто")

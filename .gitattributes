@@ -1,0 +1,4 @@
+# install.sh и шаблоны служб идут на Linux: переводы строк — только LF, при любом core.autocrlf
+* text=auto eol=lf
+*.woff2 binary
+*.png binary

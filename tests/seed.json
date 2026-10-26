@@ -1,0 +1,211 @@
+{
+ "actors": [
+  {
+   "id": "artem",
+   "name": "Артём",
+   "kind": "person",
+   "color": "artem",
+   "note": "владелец Пульта",
+   "role": "owner"
+  },
+  {
+   "id": "claude",
+   "name": "Claude",
+   "kind": "model",
+   "color": "claude",
+   "note": "Claude Code на ПК",
+   "role": "owner",
+   "owner": "artem"
+  },
+  {
+   "id": "guest",
+   "name": "guest",
+   "kind": "person",
+   "color": "ext",
+   "note": "соразработчик со стороны",
+   "role": "member"
+  }
+ ],
+ "areas": [
+  {
+   "id": "sr",
+   "name": "Space Rangers",
+   "prefix": "SR"
+  },
+  {
+   "id": "1c",
+   "name": "1С",
+   "prefix": "1C",
+   "closed": true
+  },
+  {
+   "id": "fun",
+   "name": "Хобби",
+   "prefix": "FUN"
+  },
+  {
+   "id": "inf",
+   "name": "Инфраструктура",
+   "prefix": "INF"
+  },
+  {
+   "id": "me",
+   "name": "Личное",
+   "prefix": "ME"
+  }
+ ],
+ "projects": [
+  {
+   "id": "agg",
+   "area": "sr",
+   "name": "Агрегатор"
+  },
+  {
+   "id": "lnch",
+   "area": "sr",
+   "name": "Лаунчер"
+  },
+  {
+   "id": "lab",
+   "area": "sr",
+   "name": "sr-lab"
+  },
+  {
+   "id": "tow",
+   "area": "sr",
+   "name": "Мод"
+  },
+  {
+   "id": "kit",
+   "area": "sr",
+   "name": "Набор моддера"
+  },
+  {
+   "id": "conv",
+   "area": "sr",
+   "name": "Конвертер"
+  },
+  {
+   "id": "eltan",
+   "area": "sr",
+   "name": "Совместный проект"
+  },
+  {
+   "id": "fix",
+   "area": "sr",
+   "name": "Багфиксы"
+  },
+  {
+   "id": "audit",
+   "area": "sr",
+   "name": "Аудит"
+  },
+  {
+   "id": "srref",
+   "area": "sr",
+   "name": "Справочник"
+  },
+  {
+   "id": "ms",
+   "area": "1c",
+   "name": "Работа: проект А"
+  },
+  {
+   "id": "stl",
+   "area": "1c",
+   "name": "Работа: проект Б"
+  },
+  {
+   "id": "extstore",
+   "area": "1c",
+   "name": "Работа: проект В"
+  },
+  {
+   "id": "plus",
+   "area": "1c",
+   "name": "Работа: проект Г"
+  },
+  {
+   "id": "devai",
+   "area": "1c",
+   "name": "Работа: агенты"
+  },
+  {
+   "id": "c1other",
+   "area": "1c",
+   "name": "Работа: разное"
+  },
+  {
+   "id": "fun",
+   "area": "fun",
+   "name": "Игра"
+  },
+  {
+   "id": "funwiki",
+   "area": "fun",
+   "name": "Вики"
+  },
+  {
+   "id": "funfarm",
+   "area": "fun",
+   "name": "Ферма"
+  },
+  {
+   "id": "vds",
+   "area": "inf",
+   "name": "Сервер"
+  },
+  {
+   "id": "vpn",
+   "area": "inf",
+   "name": "VPN"
+  },
+  {
+   "id": "pc",
+   "area": "inf",
+   "name": "Компьютер"
+  },
+  {
+   "id": "claudecfg",
+   "area": "inf",
+   "name": "Настройка ИИ"
+  },
+  {
+   "id": "pult",
+   "area": "inf",
+   "name": "Пульт"
+  },
+  {
+   "id": "health",
+   "area": "me",
+   "name": "Здоровье",
+   "closed": true
+  },
+  {
+   "id": "planner",
+   "area": "me",
+   "name": "Planner",
+   "closed": true
+  },
+  {
+   "id": "trade",
+   "area": "me",
+   "name": "Торговля"
+  },
+  {
+   "id": "cashback",
+   "area": "me",
+   "name": "Кэшбэк"
+  },
+  {
+   "id": "course",
+   "area": "me",
+   "name": "Курс"
+  },
+  {
+   "id": "life",
+   "area": "me",
+   "name": "Быт"
+  }
+ ]
+}

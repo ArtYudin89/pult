@@ -1,0 +1,10 @@
+[Unit]
+Description=Pult morning digest at @DIGEST_AT@ (server time zone)
+
+[Timer]
+OnCalendar=*-*-* @DIGEST_AT@:00
+# Сервер был выключен в это время — сводка уйдёт после включения
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+<meta name="color-scheme" content="light dark">
+<title>Пульт</title>
+<link rel="icon" type="image/svg+xml" href="/static/icon.svg">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<div class="app">
+  <header class="appbar">
+    <a class="logo" href="#all" aria-label="Пульт, все задачи"><svg class="mark" viewBox="0 0 20 20" aria-hidden="true"><rect class="on" x="1" y="1" width="8" height="8" rx="2.2"/><rect class="off" x="11" y="1" width="8" height="8" rx="2.2"/><rect class="off" x="1" y="11" width="8" height="8" rx="2.2"/><rect class="off" x="11" y="11" width="8" height="8" rx="2.2"/></svg>Пульт</a>
+    <label class="search" for="q"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.4 10.4L14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><input id="q" type="search" placeholder="Поиск по задачам" autocomplete="off" spellcheck="false" aria-label="Поиск по задачам"><kbd>/</kbd></label>
+    <button class="btn primary" id="new-task" type="button" hidden>+ Задача</button>
+    <span class="team" id="team"></span>
+  </header>
+  <div class="split">
+    <nav class="side" id="side" aria-label="Разделы"></nav>
+    <main class="main" id="main"><p class="empty-main">Загружаю задачи…</p></main>
+  </div>
+</div>
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden role="dialog" aria-modal="true" aria-label="Карточка задачи"></aside>
+<div class="menu" id="menu" hidden></div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+<input type="file" id="file-input" multiple hidden aria-label="Прикрепить файлы">
+
+</body>
+</html>

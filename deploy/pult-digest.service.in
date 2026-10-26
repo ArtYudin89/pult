@@ -1,0 +1,43 @@
+[Unit]
+Description=Pult morning digest to Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pult
+Group=pult
+# Кому слать — строки digest:<участник> в базе (pult_server.py admin digest-to/digest-off/digest-list).
+# Второй запуск за день ничего не шлёт: дата последней сводки хранится там же.
+ExecStart=/usr/bin/python3 /opt/pult/pult_server.py digest --db /var/lib/pult/pult.db --url @URL@ --send
+# Файл с токеном бота systemd отдаёт копией в $CREDENTIALS_DIRECTORY/tg: служба не стартует от root
+# и сам файл ей не виден.
+LoadCredential=tg:@TG@
+Environment=PYTHONUNBUFFERED=1
+
+MemoryMax=60M
+TasksMax=8
+CPUWeight=20
+TimeoutStartSec=300
+
+StateDirectory=pult
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native

@@ -1,0 +1,20 @@
+# Настройки Пульта на сервере — /etc/pult/pult.conf. Их читает deploy/install.sh при каждой установке.
+
+# Адрес страницы: из него ссылки в сводке и ссылка первого входа.
+PULT_URL=https://example.com:9447
+PULT_PORT=9447
+
+# Сертификат TLS и его ключ, например от Let's Encrypt (certbot, acme.sh). Если оставить пустыми, служба
+# будет слушать только 127.0.0.1 без TLS, а наружу её отдаст ваш обратный прокси (Caddy, nginx).
+PULT_CERT=/etc/letsencrypt/live/example.com/fullchain.pem
+PULT_KEY=/etc/letsencrypt/live/example.com/privkey.pem
+
+# Первая установка: владелец Пульта и модель ИИ с ключом (pult_server.py init). Ссылка для первого входа
+# и ключ модели лягут в /var/lib/pult/init/. PULT_AI пуст — без модели, ключ выдадите потом на странице.
+PULT_OWNER="Ваше имя"
+PULT_AI=Claude
+
+# Утренняя сводка в Telegram: файл с токеном бота (строка TELEGRAM_BOT_TOKEN=... или один токен) и время
+# по часам сервера. Файл не задан — сводки нет.
+PULT_TG_TOKEN_FILE=
+PULT_DIGEST_AT=09:00
