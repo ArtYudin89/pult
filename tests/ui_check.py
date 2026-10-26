@@ -258,7 +258,8 @@ try:
         page.fill('form[data-form="ai"] input[name="effort"]', "high")
         page.click('form[data-form="ai"] button[type="submit"]')
         page.wait_for_selector('.ai-line:has-text("claude-opus-5-5")')
-        check(call("GET", "/api/state")["ai"] == {"model": "claude-opus-5-5", "effort": "high"},
+        ai_now = call("GET", "/api/state")["ai"]
+        check((ai_now["model"], ai_now["effort"]) == ("claude-opus-5-5", "high"),
               "«Все задачи» → «изменить»: модель и усилие для всего Пульта сохранены")
         proj = task("INF-30")["project"]
         page.goto(base + "/#p=" + proj)
@@ -276,14 +277,15 @@ try:
         page.wait_for_selector("#drawer .fields")
         dd = page.locator('#drawer .fields dt:text-is("ИИ") + dd').inner_text()
         check("claude-opus-5-5" in dd and "max" in dd and "из проекта" in dd, f"карточка: строка «ИИ» — {dd!r}")
-        page.click("#drawer [data-edit]")
-        page.wait_for_selector('#drawer textarea[name="prompt"]')
-        ph = page.get_attribute('#drawer input[name="effort"]', "placeholder")
-        check(ph == "как у проекта: max", f"в карточке подсказка усилия — с проекта ({ph})")
-        page.fill('#drawer textarea[name="prompt"]', "Проверь доску на телефоне и запиши, что неудобно")
-        page.fill('#drawer input[name="effort"]', "low")
-        page.locator("#drawer").screenshot(path=os.path.join(out, "12a_card_edit.png"))
-        page.click('#drawer form[data-form="edit"] button[type="submit"]')
+        # сообщение и своё усилие карточки — через окно «Выполнить», кнопкой «Только оставить сообщение»
+        page.click("#drawer [data-run]")
+        page.wait_for_selector('#drawer form[data-form="run"]')
+        val = page.input_value('#drawer form[data-form="run"] input[name="effort"]')
+        check(val == "max", f"в окне «Выполнить» усилие подставлено по уровням — с проекта ({val})")
+        page.fill('#drawer form[data-form="run"] textarea[name="message"]', "Проверь доску на телефоне и запиши, что неудобно")
+        page.fill('#drawer form[data-form="run"] input[name="effort"]', "low")
+        page.locator("#drawer").screenshot(path=os.path.join(out, "12a_run_dialog_first.png"))
+        page.click("#drawer [data-askonly]")
         page.wait_for_selector("#drawer .ask")
         t30 = task("INF-30")
         check((t30["prompt"], t30["effort"], t30["ai"]["effort_from"]) == ("Проверь доску на телефоне и запиши, что неудобно", "low", "task"),
@@ -296,6 +298,43 @@ try:
         page.goto(base + "/#board")
         page.wait_for_selector(".bcol")
         check("ИИ" in page.locator('.bcard[data-task="INF-30"] .bc-foot').inner_text(), "на доске: значок сообщения для ИИ")
+
+        # ---------- «Выполнить»: окно передачи в работу, блок сессии, отмена ----------
+        page.goto(base + f"/#p={proj}&t=INF-30")
+        page.wait_for_selector("#drawer [data-run]")
+        page.click("#drawer [data-edit]")
+        page.wait_for_selector('#drawer form[data-form="edit"]')
+        check(page.locator('#drawer form[data-form="edit"] textarea[name="prompt"]').count() == 0,
+              "в «Изменить» поля сообщения для ИИ больше нет")
+        page.click('#drawer form[data-form="edit"] [data-cancel]')
+        page.click("#drawer [data-run]")
+        page.wait_for_selector('#drawer form[data-form="run"]')
+        msg = page.input_value('#drawer form[data-form="run"] textarea[name="message"]')
+        check(msg == "Проверь доску на телефоне и запиши, что неудобно", f"окно подставило сообщение для ИИ ({msg[:30]!r})")
+        check(page.input_value('#drawer input[name="budget"]') == "3" and page.input_value('#drawer input[name="minutes"]') == "60",
+              "пределы по умолчанию: 3% недели и 60 минут")
+        check(page.input_value('#drawer form[data-form="run"] input[name="effort"]') == "low", "усилие подставлено из карточки")
+        week = page.locator("#run-week").inner_text()
+        check("исполнитель" in week and "потолок 80%" in week, f"строка про исполнителя и неделю: {week!r}")
+        page.locator("#drawer").screenshot(path=os.path.join(out, "15_run_dialog.png"))
+        page.click('#drawer form[data-form="run"] button[type="submit"]')
+        page.wait_for_selector("#drawer .runbox")
+        t30 = call("GET", "/api/task/INF-30")
+        check(t30["runs"][0]["status"] == "queued" and t30["task"]["prompt"] == "" and t30["task"]["status"] == "doing",
+              "заявка в очереди, сообщение ушло в заявку, карточка «В работе»")
+        check("в очереди" in page.locator("#drawer .runbox").inner_text(), "в карточке — блок сессии «в очереди»")
+        page.locator("#drawer").screenshot(path=os.path.join(out, "16_card_run_queued.png"))
+        page.click("#drawer [data-runstop]")
+        page.wait_for_selector("#drawer .runbox.run-cancelled")
+        check(call("GET", "/api/task/INF-30")["runs"][0]["status"] == "cancelled", "«Отменить» снимает заявку из очереди")
+        page.goto(base + "/#all")
+        page.wait_for_selector('[data-aiedit="pult"]')
+        page.click('[data-aiedit="pult"]')
+        page.fill('form[data-form="ai"] input[name="ceiling"]', "75")
+        page.click('form[data-form="ai"] button[type="submit"]')
+        page.wait_for_selector('.ai-line:has-text("потолок")')
+        check(call("GET", "/api/state")["ai"]["ceiling"] == 75 and "75%" in page.locator(".ai-line").inner_text(),
+              "потолок недели меняется в шапке «Все задачи»")
 
         # ---------- тёмная тема ----------
         dark = browser.new_context(viewport={"width": 1440, "height": 900}, locale="ru-RU", color_scheme="dark")
@@ -362,13 +401,19 @@ try:
         check(lifted and target not in (None, "inbox") and st3 == target,
               f"телефон: долгое нажатие поднимает карточку, перенос в «{target}» → статус {st3}")
         pp.goto(base + "/#t=INF-30")
-        pp.wait_for_selector("#drawer .thumb img")
+        pp.wait_for_selector("#drawer .thumb img", state="attached")  # картинки грузятся по мере прокрутки
         dw = pp.evaluate("document.getElementById('drawer').scrollWidth")
         check(dw <= 400, f"телефон: карточка с вложениями по ширине ({dw}px)")
         pp.locator("#drawer [data-attach]").scroll_into_view_if_needed()
         pp.screenshot(path=os.path.join(out, "10_phone_card_files.png"))
-        pp.locator("#drawer .ask").scroll_into_view_if_needed()
-        pp.screenshot(path=os.path.join(out, "13_phone_card_prompt.png"))
+        pp.locator("#drawer .runbox").scroll_into_view_if_needed()
+        pp.screenshot(path=os.path.join(out, "13_phone_card_run.png"))
+        pp.click("#drawer [data-run]")
+        pp.wait_for_selector('#drawer form[data-form="run"]')
+        dw = pp.evaluate("document.getElementById('drawer').scrollWidth")
+        check(dw <= 400, f"телефон: окно «Выполнить» по ширине ({dw}px)")
+        pp.screenshot(path=os.path.join(out, "13a_phone_run_dialog.png"))
+        pp.click('#drawer form[data-form="run"] [data-cancel]')
         pp.keyboard.press("Escape")
         pp.goto(base + "/#p=" + proj)
         pp.wait_for_selector(".ai-line")

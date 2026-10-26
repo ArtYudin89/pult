@@ -36,6 +36,7 @@ import http.server
 import json
 import os
 import re
+import queue
 import secrets
 import shutil
 import socket
@@ -75,7 +76,20 @@ COOKIE = "pult_s"
 SESSION_TOUCH_SEC = 600
 SESSION_TTL_DAYS = 180
 INVITE_DAYS = 7
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+# Сессии ИИ по карточкам: заявку («Выполнить» на странице) забирает исполнитель на компьютере человека
+# (pult_runner.py с ключом модели) и отчитывается сюда. asked — сессия закончила ход вопросом человеку,
+# blocked — сессия жива и ждёт разрешения на том компьютере.
+RUN_STATES = ("queued", "started", "working", "blocked", "asked", "done", "failed", "stopped", "cancelled")
+RUN_ACTIVE = ("queued", "started", "working", "blocked")
+RUN_RU = {"queued": "в очереди", "started": "запускается", "working": "идёт", "blocked": "ждёт разрешения на ПК",
+          "asked": "ждёт ответа", "done": "готово", "failed": "ошибка", "stopped": "остановлена",
+          "cancelled": "отменена"}
+RUN_LIMITS = {"budget": ("Бюджет запуска", 3.0, 0.1, 100.0), "minutes": ("Время запуска", 60, 1, 1440),
+              "ceiling": ("Потолок недели", 80.0, 1.0, 100.0)}
+RUNNER_ONLINE_SEC = 90       # исполнитель спрашивает Пульт раз в полминуты; дольше молчит — «не в сети»
+POLL_WAIT_MAX = 25           # долгий опрос исполнителя: ответ сразу, как появится заявка
+TG_LINK_HOURS = 24           # ссылка привязки Telegram одноразовая и живёт сутки
 FILE_MAX = 25 << 20          # одно вложение
 FILES_QUOTA = 500 << 20      # все вложения вместе; меняется ключом --files-quota-mb
 FILES_MIN_FREE = 300 << 20   # столько должно остаться на диске после загрузки
@@ -92,7 +106,7 @@ MONTH_RU = ("января", "февраля", "марта", "апреля", "м�
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
-INSERT OR IGNORE INTO meta(k, v) VALUES ('schema', '4'), ('rev', '0');
+INSERT OR IGNORE INTO meta(k, v) VALUES ('schema', '5'), ('rev', '0');
 CREATE TABLE IF NOT EXISTS actors(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, color TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '', sort INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
@@ -143,6 +157,18 @@ CREATE TABLE IF NOT EXISTS files(
   created_at TEXT NOT NULL, created_by TEXT NOT NULL, deleted_at TEXT, deleted_by TEXT);
 CREATE INDEX IF NOT EXISTS files_task ON files(task_id);
 CREATE INDEX IF NOT EXISTS files_sha ON files(sha);
+CREATE TABLE IF NOT EXISTS runs(
+  id INTEGER PRIMARY KEY, task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL, task_key TEXT NOT NULL,
+  executor TEXT NOT NULL, requested_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  status TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', effort TEXT NOT NULL DEFAULT '',
+  message TEXT NOT NULL DEFAULT '', budget REAL, minutes INTEGER, ceiling REAL, resume_of INTEGER,
+  session TEXT NOT NULL DEFAULT '', bg TEXT NOT NULL DEFAULT '', folder TEXT NOT NULL DEFAULT '',
+  started_at TEXT, finished_at TEXT, week_start REAL, week_now REAL, question TEXT NOT NULL DEFAULT '',
+  result TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', stop_requested INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS runs_task ON runs(task_id, id);
+CREATE INDEX IF NOT EXISTS runs_exec ON runs(executor, status);
+CREATE TABLE IF NOT EXISTS tg_notes(
+  chat TEXT NOT NULL, msg INTEGER NOT NULL, run_id INTEGER NOT NULL, at TEXT NOT NULL, PRIMARY KEY(chat, msg));
 """
 
 # Поля задачи: имя в API → (столбец, вид значения, подпись в журнале)
@@ -190,6 +216,13 @@ class ApiError(Exception):
 
 def now_iso():
     return dt.datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def minutes_between(a, b):
+    try:
+        return max(0, round((dt.datetime.fromisoformat(b) - dt.datetime.fromisoformat(a)).total_seconds() / 60))
+    except (TypeError, ValueError):
+        return 0
 
 
 def sha(text):
@@ -323,6 +356,23 @@ def v_ai(value, field):
     return value
 
 
+def v_num(value, field, lo, hi, integer=False):
+    if isinstance(value, str):
+        value = value.strip().replace(",", ".")
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        raise ApiError(400, f"{field}: нужно число") from None
+    if not lo <= num <= hi:
+        raise ApiError(400, f"{field}: от {lo:g} до {hi:g}")
+    return int(round(num)) if integer else round(num, 2)
+
+
+def pct(value):
+    """Проценты для людей: 0,4%, 3%, 12,5%."""
+    return (f"{value:.1f}".rstrip("0").rstrip(".") if value is not None else "?").replace(".", ",") + "%"
+
+
 def v_int(value, field):
     if isinstance(value, bool) or not isinstance(value, int):
         raise ApiError(400, f"{field}: нужно целое число")
@@ -396,6 +446,7 @@ class DB:
                                   (notes, r["id"]))
                     if rows:
                         self.bump(c)
+            # Схема 5 добавила только таблицы сессий ИИ (runs, tg_notes): их заводит SCHEMA.
             c.execute("UPDATE meta SET v = ? WHERE k = 'schema'", (str(SCHEMA_VERSION),))
 
     @contextlib.contextmanager
@@ -578,10 +629,12 @@ class DB:
 
     @staticmethod
     def ai_settings(c):
-        """Модель и усилие по умолчанию для всего Пульта — строка meta 'ai'."""
+        """Модель, усилие и пределы запуска по умолчанию для всего Пульта — строка meta 'ai'."""
         r = c.execute("SELECT v FROM meta WHERE k = 'ai'").fetchone()
         v = json.loads(r["v"]) if r else {}
-        return {"model": v.get("model", ""), "effort": v.get("effort", "")}
+        out = {"model": v.get("model", ""), "effort": v.get("effort", "")}
+        out.update({k: v.get(k, spec[1]) for k, spec in RUN_LIMITS.items()})
+        return out
 
     def ai_for(self, c, r):
         """С какой моделью и усилием запускать сессию по карточке и с какого уровня они взяты."""
@@ -635,9 +688,20 @@ class DB:
                      for r in c.execute("SELECT * FROM areas ORDER BY sort, name") if owner or r["id"] in shown]
             ai = self.ai_settings(c)
             nfiles = dict(c.execute("SELECT task_id, COUNT(*) FROM files WHERE deleted_at IS NULL GROUP BY task_id"))
-            tasks = [self.task_dict(r, files=nfiles.get(r["id"], 0))
-                     for r in c.execute("SELECT * FROM tasks ORDER BY id") if r["project_id"] in acc]
+            last = {r["task_id"]: {"id": r["id"], "status": r["status"]} for r in c.execute(
+                "SELECT r.task_id, r.id, r.status FROM runs r JOIN (SELECT MAX(id) AS id FROM runs GROUP BY task_id) m "
+                "ON m.id = r.id")}
+            tasks = []
+            for r in c.execute("SELECT * FROM tasks ORDER BY id"):
+                if r["project_id"] in acc:
+                    t = self.task_dict(r, files=nfiles.get(r["id"], 0))
+                    if r["id"] in last:
+                        t["run"] = last[r["id"]]
+                    tasks.append(t)
             rows = c.execute("SELECT * FROM actors ORDER BY sort, name").fetchall()
+            # исполнители моделей: в сети ли и сколько недели израсходовано — хозяину модели и владельцу Пульта
+            runners = {r["id"]: info for r in rows if r["kind"] == "model" and (owner or r["owner_id"] == me["id"])
+                       for info in [self.runner_info(c, r["id"])] if info}
             if not owner:
                 # участнику — только те, с кем у него общие проекты, свои модели и упомянутые в его задачах
                 seen = {me["id"], me.get("owner")} | {r["id"] for r in rows if r["owner_id"] == me["id"]}
@@ -648,7 +712,7 @@ class DB:
             actors = [self.actor_dict(r) for r in rows]
         return {"rev": rev, "today": dt.date.today().isoformat(), "me": public_actor(me), "owner": owner,
                 "access": {p: LEVELS[n - 1] for p, n in acc.items()}, "actors": actors,
-                "areas": areas, "projects": projects, "tasks": tasks, "ai": ai}
+                "areas": areas, "projects": projects, "tasks": tasks, "ai": ai, "runners": runners}
 
     def task_row(self, c, key):
         r = c.execute("SELECT * FROM tasks WHERE key = ?", (norm_key(key),)).fetchone()
@@ -666,8 +730,9 @@ class DB:
             files = [self.file_dict(f) for f in self.conn.execute(
                 "SELECT * FROM files WHERE task_id = ? AND deleted_at IS NULL ORDER BY id", (r["id"],))]
             ai = self.ai_for(self.conn, r)
+            runs = self.runs_of(self.conn, r["id"])
         return {"task": dict(self.task_dict(r, full=True, files=len(files)), ai=ai),
-                "journal": [self.journal_dict(x) for x in j], "files": files}
+                "journal": [self.journal_dict(x) for x in j], "files": files, "runs": runs}
 
     def journal(self, actor, limit=100, before=None, who=None, project=None, since=None, task=None):
         sql, args = ["SELECT * FROM journal WHERE 1 = 1"], []
@@ -859,66 +924,71 @@ class DB:
 
     def update_task(self, actor, key, body):
         with self.tx() as c:
-            row = self.task_row(c, key)
-            acc = self.access(c, actor["id"])
-            self._need_edit(c, acc, row["project_id"], row["key"])
-            new = self._clean_task(c, body, creating=False)
-            dest = new.get("project_id", row["project_id"])
-            if dest != row["project_id"]:
-                if not acc.get(dest):
-                    raise ApiError(400, f"нет проекта {dest!r}")
-                if acc[dest] < 2:
-                    raise ApiError(403, f"в проекте «{self._project_name(c, dest)}» у вас доступ только на чтение")
-            comment = v_text(body.get("comment"), "комментарий", 4000)
-            if new.get("status") in CLOSED and row["status"] not in CLOSED:
-                new["done_on"] = new.get("done_on") or row["done_on"] or dt.date.today().isoformat()
-            elif "status" in new and new["status"] not in CLOSED and row["status"] in CLOSED:
-                new["done_on"] = None
-            sets, changes, fields = {}, [], set()
-            for name, (col, kind, label) in TASK_FIELDS.items():
-                if col not in new:
+            out = self._update_in_tx(c, actor, self.task_row(c, key), body)
+            if not out.get("unchanged"):
+                self.bump(c)
+            return out
+
+    def _update_in_tx(self, c, actor, row, body, extra=()):
+        """Правка карточки в открытой транзакции; extra — строки журнала сверх изменений полей."""
+        acc = self.access(c, actor["id"])
+        self._need_edit(c, acc, row["project_id"], row["key"])
+        new = self._clean_task(c, body, creating=False)
+        dest = new.get("project_id", row["project_id"])
+        if dest != row["project_id"]:
+            if not acc.get(dest):
+                raise ApiError(400, f"нет проекта {dest!r}")
+            if acc[dest] < 2:
+                raise ApiError(403, f"в проекте «{self._project_name(c, dest)}» у вас доступ только на чтение")
+        comment = v_text(body.get("comment"), "комментарий", 4000)
+        if new.get("status") in CLOSED and row["status"] not in CLOSED:
+            new["done_on"] = new.get("done_on") or row["done_on"] or dt.date.today().isoformat()
+        elif "status" in new and new["status"] not in CLOSED and row["status"] in CLOSED:
+            new["done_on"] = None
+        sets, changes, fields = {}, [], set()
+        for name, (col, kind, label) in TASK_FIELDS.items():
+            if col not in new:
+                continue
+            old, value = row[col], new[col]
+            if old == value or (kind in ("text", "notes", "prompt", "ai") and (old or "") == (value or "")):
+                continue
+            sets[col] = value
+            fields.add(name)
+            if kind == "status":
+                changes.append(f"Статус: {STATUS_RU[old]} → {STATUS_RU[value]}")
+            elif kind == "actor":
+                changes.append(f"Держит: {self._actor_name(c, old)} → {self._actor_name(c, value)}")
+            elif kind == "project":
+                changes.append(f"Проект: {self._project_name(c, old)} → {self._project_name(c, value)}")
+            elif kind == "title":
+                changes.append(f"Название: «{short(old, 60)}» → «{short(value, 60)}»")
+            elif kind == "text":
+                changes.append(f"{label}: «{short(value)}»" if value else f"{label}: убрано")
+            elif kind == "date":
+                if col == "done_on" and "status" in sets:
                     continue
-                old, value = row[col], new[col]
-                if old == value or (kind in ("text", "notes", "prompt", "ai") and (old or "") == (value or "")):
-                    continue
-                sets[col] = value
-                fields.add(name)
-                if kind == "status":
-                    changes.append(f"Статус: {STATUS_RU[old]} → {STATUS_RU[value]}")
-                elif kind == "actor":
-                    changes.append(f"Держит: {self._actor_name(c, old)} → {self._actor_name(c, value)}")
-                elif kind == "project":
-                    changes.append(f"Проект: {self._project_name(c, old)} → {self._project_name(c, value)}")
-                elif kind == "title":
-                    changes.append(f"Название: «{short(old, 60)}» → «{short(value, 60)}»")
-                elif kind == "text":
-                    changes.append(f"{label}: «{short(value)}»" if value else f"{label}: убрано")
-                elif kind == "date":
-                    if col == "done_on" and "status" in sets:
-                        continue
-                    changes.append(f"{label}: {ddmm(value)}" if value else f"{label}: дата убрана")
-                elif kind == "notes":
-                    changes.append("Описание добавлено" if not old else "Описание убрано" if not value
-                                   else "Описание изменено")
-                elif kind == "prompt":
-                    changes.append(prompt_change(value))
-                elif kind == "ai":
-                    changes.append(ai_change(label, value))
-            if not sets and not comment:
-                return {"task": self.task_out(c, row), "unchanged": True}
-            if sets.keys() & {"holder", "project_id"}:
-                self._check_holder(c, actor, sets.get("holder", row["holder"]), sets.get("project_id", dest))
-            if sets and body.get("version") is not None and body["version"] != row["version"]:
-                self._check_clash(c, actor, row, body["version"], fields)
-            if sets:
-                sets.update(updated_at=now_iso(), updated_by=actor["id"])
-                c.execute(f"UPDATE tasks SET {', '.join(k + ' = ?' for k in sets)}, version = version + 1 "
-                          f"WHERE id = ?", (*sets.values(), row["id"]))
-                row = c.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone()
-            self._journal(c, actor, actor.get("via"), "change" if sets else "comment", task=row,
-                          text=comment, changes=changes, fields=fields)
-            self.bump(c)
-            return {"task": self.task_out(c, row)}
+                changes.append(f"{label}: {ddmm(value)}" if value else f"{label}: дата убрана")
+            elif kind == "notes":
+                changes.append("Описание добавлено" if not old else "Описание убрано" if not value
+                               else "Описание изменено")
+            elif kind == "prompt":
+                changes.append(prompt_change(value))
+            elif kind == "ai":
+                changes.append(ai_change(label, value))
+        if not sets and not comment and not extra:
+            return {"task": self.task_out(c, row), "unchanged": True}
+        if sets.keys() & {"holder", "project_id"}:
+            self._check_holder(c, actor, sets.get("holder", row["holder"]), sets.get("project_id", dest))
+        if sets and body.get("version") is not None and body["version"] != row["version"]:
+            self._check_clash(c, actor, row, body["version"], fields)
+        if sets:
+            sets.update(updated_at=now_iso(), updated_by=actor["id"])
+            c.execute(f"UPDATE tasks SET {', '.join(k + ' = ?' for k in sets)}, version = version + 1 "
+                      f"WHERE id = ?", (*sets.values(), row["id"]))
+            row = c.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone()
+        self._journal(c, actor, actor.get("via"), "change" if sets or extra else "comment", task=row,
+                      text=comment, changes=changes + list(extra), fields=fields)
+        return {"task": self.task_out(c, row)}
 
     def delete_task(self, actor, key, version=None):
         with self.tx() as c:
@@ -999,6 +1069,316 @@ class DB:
             return {"ok": True, "task": self.task_out(c, row)}
 
     # ----- утренняя сводка -----
+
+    # ----- сессии ИИ по карточкам: заявка → исполнитель на компьютере человека → отчёты -----
+
+    notify = None  # serve() ставит сюда отправку в Telegram: notify(событие) после записи в базу
+
+    @staticmethod
+    def run_dict(r):
+        d = {k: r[k] for k in ("id", "executor", "requested_by", "created_at", "updated_at", "status", "model",
+                               "effort", "message", "budget", "minutes", "ceiling", "resume_of", "session", "bg",
+                               "folder", "started_at", "finished_at", "week_start", "week_now", "question", "result",
+                               "reason")}
+        d["task"] = r["task_key"]
+        d["stop_requested"] = bool(r["stop_requested"])
+        d["spent"] = (round(r["week_now"] - r["week_start"], 2)
+                      if r["week_now"] is not None and r["week_start"] is not None else None)
+        return d
+
+    @staticmethod
+    def _run_row(c, run_id):
+        try:
+            r = c.execute("SELECT * FROM runs WHERE id = ?", (int(run_id),)).fetchone()
+        except (TypeError, ValueError):
+            r = None
+        if not r:
+            raise ApiError(404, f"нет сессии {run_id}")
+        return r
+
+    def runs_of(self, c, task_id, limit=10):
+        return [self.run_dict(r) for r in c.execute("SELECT * FROM runs WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+                                                    (task_id, limit))]
+
+    @staticmethod
+    def runner_info(c, actor_id):
+        r = c.execute("SELECT v FROM meta WHERE k = ?", ("runner:" + actor_id,)).fetchone()
+        if not r:
+            return None
+        info = json.loads(r["v"])
+        info["online"] = time.time() - info.get("ts", 0) < RUNNER_ONLINE_SEC
+        return info
+
+    def _active_run(self, c, task_id):
+        return c.execute(f"SELECT * FROM runs WHERE task_id = ? AND status IN ({', '.join('?' * len(RUN_ACTIVE))})",
+                         (task_id, *RUN_ACTIVE)).fetchone()
+
+    def _executor(self, c, actor, ident):
+        """Модель, которой человек передаёт карточку: запускать её может только хозяин — подписка и машина его."""
+        if actor.get("kind") != "person":
+            raise ApiError(403, "передать в работу может только человек: модель не запускает сессии сама")
+        ex = c.execute("SELECT * FROM actors WHERE id = ? AND kind = 'model' AND active = 1",
+                       (str(ident or ""),)).fetchone()
+        if not ex:
+            raise ApiError(400, "кто выполнит: нужна модель из участников")
+        if ex["owner_id"] != actor["id"]:
+            raise ApiError(403, f"запускать «{ex['name']}» может только её хозяин — "
+                                f"{self._actor_name(c, ex['owner_id'])}")
+        return ex
+
+    def _limits(self, c, body):
+        s = self.ai_settings(c)
+        return {k: v_num(body.get(k, s[k]), RUN_LIMITS[k][0], RUN_LIMITS[k][2], RUN_LIMITS[k][3],
+                         integer=k == "minutes") for k in ("budget", "minutes")}, s["ceiling"]
+
+    def _insert_run(self, c, row, ex, actor, model, effort, message, limits, ceiling, resume=None):
+        stamp = now_iso()
+        c.execute("INSERT INTO runs(task_id, task_key, executor, requested_by, created_at, updated_at, status, model, "
+                  "effort, message, budget, minutes, ceiling, resume_of, session) "
+                  "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (row["id"], row["key"], ex["id"], actor["id"], stamp, stamp, model, effort, message,
+                   limits["budget"], limits["minutes"], ceiling, resume["id"] if resume else None,
+                   resume["session"] if resume else ""))
+        return self._run_row(c, c.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+    def create_run(self, actor, key, body):
+        """«Выполнить»: карточку держит выбранная модель, статус «В работе», заявка ждёт исполнителя."""
+        message = v_text(body.get("message"), "Что сделать", 4000, required=True)
+        with self.tx() as c:
+            row = self.task_row(c, key)
+            ex = self._executor(c, actor, body.get("executor"))
+            busy = self._active_run(c, row["id"])
+            if busy:
+                raise ApiError(409, f"у {row['key']} уже есть сессия ИИ: {RUN_RU[busy['status']]}")
+            limits, ceiling = self._limits(c, body)
+            card = {"project_id": row["project_id"],
+                    "ai_model": v_ai(body["model"], "Модель ИИ") if "model" in body else row["ai_model"],
+                    "ai_effort": v_ai(body["effort"], "Усилие ИИ") if "effort" in body else row["ai_effort"]}
+            ai = self.ai_for(c, card)
+            patch = {k: body[k] for k in ("notes", "model", "effort", "version") if k in body}
+            patch.update(holder=ex["id"], status="doing", comment=message)
+            if row["prompt"]:
+                patch["prompt"] = ""  # поручение уходит в заявку: ручная сессия не возьмёт его второй раз
+            line = (f"Передано в работу: {ex['name']} · {ai['model'] or 'модель по умолчанию'} · "
+                    f"усилие {ai['effort'] or 'по умолчанию'} · бюджет {pct(limits['budget'])} недели · "
+                    f"{limits['minutes']} мин")
+            self._update_in_tx(c, actor, row, patch, extra=[line])
+            row = self.task_row(c, row["key"])
+            run = self._insert_run(c, row, ex, actor, ai["model"], ai["effort"], message, limits, ceiling)
+            self.bump(c)
+            return {"task": self.task_out(c, row), "run": self.run_dict(run)}
+
+    def reply_run(self, actor, run_id, body):
+        """Ответ человека: новая заявка продолжает ту же сессию (claude --resume), если она была."""
+        message = v_text(body.get("message"), "Ответ", 4000, required=True)
+        with self.tx() as c:
+            prev = self._run_row(c, run_id)
+            ex = self._executor(c, actor, prev["executor"])
+            row = c.execute("SELECT * FROM tasks WHERE id = ?", (prev["task_id"],)).fetchone()
+            if not row:
+                raise ApiError(404, f"задачи {prev['task_key']} больше нет")
+            busy = self._active_run(c, row["id"])
+            if busy:
+                raise ApiError(409, f"у {row['key']} сессия ещё {RUN_RU[busy['status']]}"
+                                    + (": ответить можно на том компьютере или остановить её"
+                                       if busy["status"] == "blocked" else ""))
+            limits, ceiling = self._limits(c, body)
+            resume = prev if prev["session"] else None
+            line = ("Ответ в сессию ИИ — продолжить ту же сессию" if resume else "Передано в работу заново") + \
+                   f" · бюджет {pct(limits['budget'])} недели · {limits['minutes']} мин"
+            self._update_in_tx(c, actor, row, {"holder": ex["id"], "status": "doing", "comment": message},
+                               extra=[line])
+            row = self.task_row(c, row["key"])
+            run = self._insert_run(c, row, ex, actor, prev["model"], prev["effort"], message, limits, ceiling,
+                                   resume=resume)
+            self.bump(c)
+            return {"task": self.task_out(c, row), "run": self.run_dict(run)}
+
+    def stop_run(self, actor, run_id):
+        with self.tx() as c:
+            r = self._run_row(c, run_id)
+            ex = c.execute("SELECT owner_id FROM actors WHERE id = ?", (r["executor"],)).fetchone()
+            if actor.get("kind") != "person" or not (actor["id"] in (r["requested_by"], ex and ex["owner_id"])
+                                                     or self.is_owner(c, actor["id"])):
+                raise ApiError(403, "остановить сессию может тот, кто её запустил, или хозяин модели")
+            if r["status"] not in RUN_ACTIVE:
+                raise ApiError(409, f"сессия уже {RUN_RU[r['status']]}")
+            stamp = now_iso()
+            if r["status"] == "queued":
+                c.execute("UPDATE runs SET status = 'cancelled', finished_at = ?, updated_at = ?, reason = ? "
+                          "WHERE id = ?", (stamp, stamp, "отменена до запуска", r["id"]))
+                line = "Сессия ИИ отменена до запуска"
+            else:
+                c.execute("UPDATE runs SET stop_requested = 1, updated_at = ? WHERE id = ?", (stamp, r["id"]))
+                line = "Сессию ИИ попросили остановить"
+            task = c.execute("SELECT * FROM tasks WHERE id = ?", (r["task_id"],)).fetchone()
+            if task:
+                self._journal(c, actor, actor.get("via"), "run", task=task, changes=[line])
+            self.bump(c)
+            return {"run": self.run_dict(self._run_row(c, r["id"]))}
+
+    def _run_for_runner(self, c, r):
+        """Заявка исполнителю: что запустить, где и с какими пределами."""
+        t = c.execute("SELECT t.key, t.title, t.project_id, p.name AS pname, p.path, a.name AS aname FROM tasks t "
+                      "JOIN projects p ON p.id = t.project_id JOIN areas a ON a.id = p.area_id WHERE t.id = ?",
+                      (r["task_id"],)).fetchone()
+        d = self.run_dict(r)
+        d.update(title=t["title"] if t else "", project=t["project_id"] if t else "", project_name=t["pname"] if t else "",
+                 project_path=t["path"] if t else "", area_name=t["aname"] if t else "",
+                 requester=self._actor_name(c, r["requested_by"]))
+        return d
+
+    def runner_poll(self, actor, body, beat=True):
+        """Исполнитель спрашивает заявки своей модели; заодно — его отметка «в сети» и расход недели."""
+        if actor.get("kind") != "model":
+            raise ApiError(403, "заявки забирает исполнитель с ключом модели")
+        with self.tx() as c:
+            if beat:
+                info = {"ts": time.time(), "seen": now_iso(), "host": v_text(body.get("host"), "host", 80),
+                        "version": v_text(body.get("version"), "version", 40), "busy": bool(body.get("busy"))}
+                for k in ("week", "five"):
+                    if isinstance(body.get(k), (int, float)) and not isinstance(body.get(k), bool):
+                        info[k] = round(float(body[k]), 2)
+                for k in ("week_resets", "five_resets", "usage_at"):
+                    if isinstance(body.get(k), (int, float)) and not isinstance(body.get(k), bool):
+                        info[k] = int(body[k])
+                c.execute("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)", ("runner:" + actor["id"], json.dumps(info)))
+            stop = [r["id"] for r in c.execute("SELECT id FROM runs WHERE executor = ? AND stop_requested = 1 AND "
+                                               "status IN ('started', 'working', 'blocked')", (actor["id"],))]
+            # первый опрос после запуска исполнителя: его незавершённые сессии — подхватить или закрыть
+            mine = [self._run_for_runner(c, r) for r in c.execute(
+                "SELECT * FROM runs WHERE executor = ? AND status IN ('started', 'working', 'blocked') ORDER BY id",
+                (actor["id"],))] if body.get("hello") else []
+            run = None
+            if not body.get("busy") and not mine:
+                r = c.execute("SELECT * FROM runs WHERE executor = ? AND status = 'queued' ORDER BY id LIMIT 1",
+                              (actor["id"],)).fetchone()
+                if r:
+                    stamp = now_iso()
+                    c.execute("UPDATE runs SET status = 'started', started_at = ?, updated_at = ? WHERE id = ?",
+                              (stamp, stamp, r["id"]))
+                    run = self._run_for_runner(c, self._run_row(c, r["id"]))
+                    self.bump(c)
+        return {"run": run, "stop": stop, "mine": mine}
+
+    def run_report(self, actor, run_id, body):
+        """Отчёт исполнителя о сессии: состояние, вопрос, итог, расход недели."""
+        if actor.get("kind") != "model":
+            raise ApiError(403, "отчитывается исполнитель с ключом модели")
+        status = body.get("status")
+        if status is not None and status not in ("working", "blocked", "asked", "done", "failed", "stopped"):
+            raise ApiError(400, "status: working, blocked, asked, done, failed или stopped")
+        event = None
+        with self.tx() as c:
+            r = self._run_row(c, run_id)
+            if r["executor"] != actor["id"]:
+                raise ApiError(404, f"нет сессии {run_id}")
+            if r["status"] not in ("started", "working", "blocked"):
+                return {"ok": False, "status": r["status"], "stop": False}
+            sets = {}
+            for k in ("session", "bg", "folder"):
+                if k in body:
+                    sets[k] = v_text(body[k], k, 300)
+            for k in ("week_start", "week_now"):
+                if body.get(k) is not None:
+                    sets[k] = v_num(body[k], k, 0, 100)
+            for k, n in (("question", 2000), ("result", 4000), ("reason", 500)):
+                if k in body:
+                    sets[k] = v_text(body[k], k, n)
+            moved = bool(status) and status != r["status"]
+            if status:
+                sets["status"] = status
+            if status in ("asked", "done", "failed", "stopped"):
+                sets.update(finished_at=now_iso(), stop_requested=0)
+            sets["updated_at"] = now_iso()
+            c.execute(f"UPDATE runs SET {', '.join(k + ' = ?' for k in sets)} WHERE id = ?", (*sets.values(), r["id"]))
+            r = self._run_row(c, r["id"])
+            if moved and status != "working":
+                task = c.execute("SELECT * FROM tasks WHERE id = ?", (r["task_id"],)).fetchone()
+                d = self.run_dict(r)
+                line = f"Сессия ИИ: {RUN_RU[status]}" + (f" — {r['reason']}" if r["reason"] else "")
+                line += f" · {minutes_between(r['started_at'], r['finished_at'] or now_iso())} мин"
+                if d["spent"] is not None:
+                    line += f" · {pct(d['spent'])} недели"
+                if task:
+                    self._journal(c, actor, actor.get("via"), "run", task=task, text=r["question"] or r["result"],
+                                  changes=[line])
+                event = {"run": d, "title": task["title"] if task else "", "line": line,
+                         "executor": self._actor_name(c, r["executor"])}
+            if moved or "question" in sets or "result" in sets:
+                self.bump(c)
+            stop = bool(r["stop_requested"])
+        if event and self.notify:
+            self.notify(event)
+        return {"ok": True, "status": r["status"], "stop": stop}
+
+    # ----- Telegram: привязка чата к человеку и ответы на уведомления -----
+
+    def tg_link_code(self, actor, ident):
+        if actor.get("kind") != "person" or actor["id"] != ident:
+            raise ApiError(403, "привязать Telegram человек может только себе — ссылка откроет вход от его имени")
+        code = secrets.token_urlsafe(16)
+        with self.tx() as c:
+            c.execute("DELETE FROM meta WHERE k LIKE 'tglink:%' AND json_extract(v, '$.actor') = ?", (ident,))
+            c.execute("INSERT INTO meta(k, v) VALUES (?, ?)", ("tglink:" + code, json.dumps(
+                {"actor": ident, "expires": time.time() + TG_LINK_HOURS * 3600})))
+        return code
+
+    def tg_use_code(self, code, chat, user):
+        """/start КОД в боте: чат становится Telegram этого человека. None — код неверный или истёк."""
+        with self.tx() as c:
+            r = c.execute("SELECT v FROM meta WHERE k = ?", ("tglink:" + str(code),)).fetchone()
+            if not r:
+                return None
+            c.execute("DELETE FROM meta WHERE k = ?", ("tglink:" + str(code),))
+            v = json.loads(r["v"])
+            if v["expires"] < time.time():
+                return None
+            c.execute("DELETE FROM meta WHERE k LIKE 'tg:%' AND k != 'tg:offset' AND json_extract(v, '$.chat') = ?",
+                      (str(chat),))
+            c.execute("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)", ("tg:" + v["actor"], json.dumps(
+                {"chat": str(chat), "user": user or "", "at": now_iso()})))
+            me = self.actor(v["actor"])
+            if me:
+                self._people_journal(c, dict(me, via="telegram"), f"{me['name']}: Telegram привязан"
+                                     + (f" (@{user})" if user else ""))
+                self.bump(c)
+            return me
+
+    def tg_unlink(self, actor, ident):
+        with self.tx() as c:
+            if actor["id"] != ident:
+                self.need_owner(c, actor, "отвязывать чужой Telegram")
+            c.execute("DELETE FROM meta WHERE k = ?", ("tg:" + ident,))
+            self._people_journal(c, actor, f"{self._actor_name(c, ident)}: Telegram отвязан")
+            self.bump(c)
+        return {"ok": True}
+
+    def meta_get(self, k, default=None):
+        r = self.q1("SELECT v FROM meta WHERE k = ?", (k,))
+        return json.loads(r["v"]) if r else default
+
+    def meta_set(self, k, value):
+        with self.tx() as c:
+            c.execute("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)", (k, json.dumps(value)))
+
+    def tg_of(self, actor_id):
+        r = self.q1("SELECT v FROM meta WHERE k = ?", ("tg:" + actor_id,))
+        return json.loads(r["v"]) if r else None
+
+    def tg_actor_by_chat(self, chat):
+        r = self.q1("SELECT k FROM meta WHERE k LIKE 'tg:%' AND k != 'tg:offset' AND json_extract(v, '$.chat') = ?",
+                    (str(chat),))
+        return self.actor(r["k"][3:]) if r else None
+
+    def tg_note(self, chat, msg, run_id):
+        with self.tx() as c:
+            c.execute("INSERT OR REPLACE INTO tg_notes(chat, msg, run_id, at) VALUES (?, ?, ?, ?)",
+                      (str(chat), int(msg), int(run_id), now_iso()))
+
+    def tg_run_of(self, chat, msg):
+        r = self.q1("SELECT run_id FROM tg_notes WHERE chat = ? AND msg = ?", (str(chat), int(msg)))
+        return r["run_id"] if r else None
 
     def digest(self, actor_id, base_url, today=None):
         """Сводка для участника — только то, что ему видно: просрочено, пора проверить, сроки на неделе,
@@ -1203,10 +1583,12 @@ class DB:
         return {"ok": True, "created": created}
 
     def save_settings(self, actor, body):
-        """Модель и усилие ИИ для всего Пульта — верхний уровень: раздел, проект и карточка их переопределяют."""
-        extra = set(body) - set(AI_FIELDS)
+        """Модель и усилие ИИ для всего Пульта — верхний уровень: раздел, проект и карточка их переопределяют.
+        Здесь же пределы запуска по умолчанию (бюджет в % недели, минуты) и потолок недели для исполнителя."""
+        extra = set(body) - set(AI_FIELDS) - set(RUN_LIMITS)
         if extra:
-            raise ApiError(400, f"настройки Пульта: только {', '.join(AI_FIELDS)}, а не {', '.join(sorted(extra))}")
+            raise ApiError(400, f"настройки Пульта: только {', '.join(list(AI_FIELDS) + list(RUN_LIMITS))}, "
+                                f"а не {', '.join(sorted(extra))}")
         with self.tx() as c:
             self.need_owner(c, actor, "менять настройки Пульта")
             cur = self.ai_settings(c)
@@ -1220,6 +1602,13 @@ class DB:
                     gone = "убрана" if name == "model" else "убрано"
                     changes.append(f"{label} для всего Пульта: {value}" if value
                                    else f"{label} для всего Пульта {gone}")
+            for name, (label, _, lo, hi) in RUN_LIMITS.items():
+                if name in body:
+                    value = v_num(body[name], label, lo, hi, integer=name == "minutes")
+                    if value != cur[name]:
+                        cur[name] = value
+                        changes.append(f"{label}: {value} мин" if name == "minutes"
+                                       else f"{label}: {pct(value)}" + (" недели" if name == "budget" else ""))
             if changes:
                 c.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('ai', ?)", (json.dumps(cur),))
                 self._journal(c, actor, actor.get("via"), "settings", changes=changes)
@@ -1532,6 +1921,8 @@ class DB:
                                                 (r["id"],)).fetchall()]
                 d["invites"] = [self.invite_dict(i) for i in c.execute(
                     "SELECT * FROM invites WHERE actor_id = ? ORDER BY id DESC", (r["id"],)).fetchall()]
+                tg = c.execute("SELECT v FROM meta WHERE k = ?", ("tg:" + r["id"],)).fetchone()
+                d["telegram"] = {k: v for k, v in json.loads(tg["v"]).items() if k != "chat"} if tg else None
                 out.append(d)
         return {"people": out, "owner": owner, "me": me["id"]}
 
@@ -1721,6 +2112,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ApiError(400, "нужен объект JSON")
         return data
 
+    def runner_poll(self, actor):
+        """Долгий опрос: исполнитель ждёт до wait секунд, ответ — сразу, как появится заявка или просьба остановить."""
+        db, body = self.server.db, self.read_json()
+        wait = body.get("wait") or 0
+        wait = max(0, min(int(wait), POLL_WAIT_MAX)) if isinstance(wait, (int, float)) else 0
+        out = db.runner_poll(actor, body)
+        deadline = time.time() + wait
+        while not out["run"] and not out["stop"] and time.time() < deadline:
+            time.sleep(1)
+            out = db.runner_poll(actor, body, beat=False)
+        return self.send_json(200, out)
+
     def upload(self, actor, key):
         """Вложение — сырым телом запроса, имя — в заголовке X-File-Name (UTF-8 в %-кодировке).
         Файл пишется на диск по частям, так что память службы от размера файла не зависит."""
@@ -1902,6 +2305,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(200, db.people(actor))
         if method == "PATCH" and parts == ["settings"]:
             return self.send_json(200, db.save_settings(actor, self.read_json()))
+        if method == "POST" and parts == ["runner", "poll"]:
+            return self.runner_poll(actor)
+        if method == "POST" and head == "run" and len(parts) == 3 and parts[2] in ("stop", "reply", "report"):
+            body = self.read_json()
+            if parts[2] == "stop":
+                return self.send_json(200, db.stop_run(actor, parts[1]))
+            if parts[2] == "reply":
+                return self.send_json(201, db.reply_run(actor, parts[1], body))
+            return self.send_json(200, db.run_report(actor, parts[1], body))
         if head == "task":
             if method == "POST" and len(parts) == 1:
                 return self.send_json(201, {"task": db.create_task(actor, self.read_json())})
@@ -1927,6 +2339,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self.send_json(200, db.update_task(actor, key, {"comment": text}))
                 if method == "POST" and parts[2:] == ["files"]:
                     return self.upload(actor, key)
+                if method == "POST" and parts[2:] == ["run"]:
+                    return self.send_json(201, db.create_run(actor, key, self.read_json()))
         if head in ("project", "area"):
             if method == "POST" and len(parts) == 1:
                 return self.send_json(200, db.save_simple(actor, head, self.read_json()))
@@ -1937,6 +2351,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(200, db.save_actor(actor, self.read_json()))
             if method == "PATCH" and len(parts) == 2:
                 return self.send_json(200, db.save_actor(actor, self.read_json(), ident=parts[1]))
+            if len(parts) == 3 and parts[2] == "telegram" and method in ("POST", "DELETE"):
+                self.read_json()
+                if method == "DELETE":
+                    return self.send_json(200, db.tg_unlink(actor, parts[1]))
+                bot = self.server.bot
+                if not bot or not bot.username:
+                    raise ApiError(400, "у этого Пульта нет бота Telegram (PULT_TG_TOKEN_FILE на сервере)")
+                code = db.tg_link_code(actor, parts[1])
+                return self.send_json(200, {"link": f"https://t.me/{bot.username}?start={code}",
+                                            "bot": bot.username, "hours": TG_LINK_HOURS})
             action = {"grant": db.set_grant, "invite": db.create_invite, "key": db.create_key}.get(
                 parts[2] if len(parts) == 3 else "")
             if method == "POST" and action:
@@ -1993,6 +2417,7 @@ class Server(http.server.ThreadingHTTPServer):
         self.tls = ssl_ctx is not None
         self.proxy = proxy
         self.limiter = LoginLimiter()
+        self.bot = None  # TelegramBot, если серверу дан токен бота
         super().__init__(addr, Handler)
 
     def finish_request(self, request, client_address):
@@ -2082,7 +2507,13 @@ def serve(args):
     threading.Thread(target=upkeep_loop, args=(db, args.db, args.backup_dir, files_dir), daemon=True).start()
     srv = Server((host, args.port), db, static, ctx, args.dev_actor, files_dir,
                  int(args.file_max_mb * (1 << 20)), int(args.files_quota_mb * (1 << 20)), proxy=args.proxy)
-    print(f"pult: {'http' if ctx is None else 'https'}://{host}:{args.port}, база {args.db}", file=sys.stderr)
+    tg_file = args.tg_token_file or os.path.join(os.environ.get("CREDENTIALS_DIRECTORY", ""), "tg")
+    if args.tg_token_file or (os.environ.get("CREDENTIALS_DIRECTORY") and os.path.exists(tg_file)):
+        srv.bot = TelegramBot(db, read_bot_token(tg_file), args.url, api=args.tg_api)
+        db.notify = srv.bot.notify
+        srv.bot.start()
+    print(f"pult: {'http' if ctx is None else 'https'}://{host}:{args.port}, база {args.db}"
+          + (", бот Telegram" if srv.bot else ""), file=sys.stderr)
     srv.serve_forever()
 
 
@@ -2126,6 +2557,131 @@ def send_telegram(token, chat, text, api=TELEGRAM_API, tries=3, pause=20):
         if attempt + 1 < tries:
             time.sleep(pause * (attempt + 1))
     raise RuntimeError(f"Telegram не принял сводку: {last}")
+
+
+class TelegramBot:
+    """Бот Пульта: вести о сессиях ИИ тому, кто их запустил, и его ответы — продолжением той же сессии.
+    Обновления бота читает только Пульт (getUpdates), поэтому бот — свой, а не бот другой программы."""
+
+    def __init__(self, db, token, base_url, api=TELEGRAM_API):
+        self.db, self.token, self.base_url, self.api = db, token, (base_url or "").rstrip("/"), api.rstrip("/")
+        self.username = ""
+        self.out = queue.Queue()
+        local = (urllib.parse.urlsplit(self.api).hostname or "") in ("127.0.0.1", "localhost")
+        self.opener = urllib.request.build_opener(*([urllib.request.ProxyHandler({})] if local else []))
+
+    def call(self, method, params=None, timeout=30):
+        """Запрос к Bot API; в тексте ошибок токена нет — адрес запроса не печатаем."""
+        req = urllib.request.Request(f"{self.api}/bot{self.token}/{method}",
+                                     data=urllib.parse.urlencode(params or {}).encode())
+        try:
+            with self.opener.open(req, timeout=timeout) as r:
+                answer = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                desc = json.loads(e.read().decode("utf-8")).get("description")
+            except ValueError:
+                desc = ""
+            raise RuntimeError(f"Telegram {method}: HTTP {e.code} {desc}"[:300]) from None
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise RuntimeError(f"Telegram {method}: {type(e).__name__}") from None
+        if not answer.get("ok"):
+            raise RuntimeError(f"Telegram {method}: {answer.get('description')}"[:300])
+        return answer["result"]
+
+    def start(self):
+        threading.Thread(target=self.poll_loop, name="tg-poll", daemon=True).start()
+        threading.Thread(target=self.send_loop, name="tg-send", daemon=True).start()
+
+    def send(self, chat, text, run_id=None):
+        self.out.put((chat, text, run_id))
+
+    def send_loop(self):
+        while True:
+            chat, text, run_id = self.out.get()
+            for attempt in range(3):
+                try:
+                    msg = self.call("sendMessage", {"chat_id": chat, "text": text[:DIGEST_LIMIT],
+                                                    "disable_web_page_preview": "true"})
+                    if run_id:
+                        self.db.tg_note(chat, msg["message_id"], run_id)
+                    break
+                except RuntimeError as e:
+                    print(f"telegram: {e}", file=sys.stderr)
+                    time.sleep(5 * (attempt + 1))
+
+    def poll_loop(self):
+        while not self.username:
+            try:
+                self.username = self.call("getMe")["username"]
+            except (RuntimeError, KeyError) as e:
+                print(f"telegram: {e}", file=sys.stderr)
+                time.sleep(30)
+        offset = self.db.meta_get("tg:offset", 0)
+        while True:
+            try:
+                updates = self.call("getUpdates", {"offset": offset, "timeout": 50,
+                                                   "allowed_updates": '["message"]'}, timeout=70)
+            except RuntimeError as e:
+                print(f"telegram: {e}", file=sys.stderr)
+                time.sleep(10)
+                continue
+            for u in updates:
+                offset = u["update_id"] + 1
+                try:
+                    self.handle(u.get("message") or {})
+                except Exception as e:  # чужое сообщение не должно ронять бота
+                    print(f"telegram: {type(e).__name__}: {e}", file=sys.stderr)
+            if updates:
+                self.db.meta_set("tg:offset", offset)
+
+    def handle(self, m):
+        chat = m.get("chat") or {}
+        if not chat.get("id") or chat.get("type") != "private":
+            return
+        chat, text = chat["id"], (m.get("text") or "").strip()
+        if text.startswith("/start"):
+            code = text[len("/start"):].strip()
+            if not code:
+                return self.send(chat, "Это бот Пульта. Привязать Telegram: на странице Пульта «Участники» → вы → "
+                                       "«Привязать Telegram».")
+            me = self.db.tg_use_code(code, chat, (m.get("from") or {}).get("username") or "")
+            return self.send(chat, f"Готово, {me['name']}: сюда будут приходить вести о сессиях ИИ по вашим "
+                                   f"карточкам. Чтобы продолжить сессию, ответьте на её сообщение." if me else
+                             "Ссылка устарела или уже использована — возьмите новую на странице Пульта.")
+        me = self.db.tg_actor_by_chat(chat)
+        if not me:
+            return self.send(chat, "Этот чат не привязан к Пульту: «Участники» → вы → «Привязать Telegram».")
+        reply = m.get("reply_to_message") or {}
+        run_id = self.db.tg_run_of(chat, reply["message_id"]) if reply.get("message_id") else None
+        if not run_id:
+            return self.send(chat, "Чтобы продолжить сессию, ответьте на её сообщение: «Ответить» или свайп влево.")
+        if not text:
+            return self.send(chat, "Понимаю только текст.")
+        try:
+            out = self.db.reply_run(dict(me, via="telegram"), run_id, {"message": text})
+        except ApiError as e:
+            return self.send(chat, f"Не передал: {e}")
+        self.send(chat, f"Передал в работу: {out['task']['key']}. Сессия продолжится, когда исполнитель возьмёт "
+                        f"заявку.", out["run"]["id"])
+
+    def notify(self, event):
+        """Событие сессии — тому, кто её запустил, если его Telegram привязан."""
+        run = event["run"]
+        tg = self.db.tg_of(run["requested_by"])
+        if not tg:
+            return
+        lines = [f"{run['task']} · {event['title']}", event["line"].replace("Сессия ИИ", event["executor"], 1)]
+        body = run["question"] if run["status"] == "asked" else run["result"]
+        if body:
+            lines += ["", short(body, 1500)]
+        if run["status"] == "blocked" and run["bg"]:
+            lines += ["", f"На том компьютере: claude attach {run['bg']}"]
+        if self.base_url:
+            lines += ["", f"{self.base_url}/#t={urllib.parse.quote(run['task'])}"]
+        if run["status"] != "blocked":
+            lines.append("Ответьте на это сообщение, чтобы продолжить сессию.")
+        self.send(tg["chat"], "\n".join(lines), run["id"])
 
 
 def digest_cmd(args):
@@ -2367,6 +2923,10 @@ def main(argv=None):
     s.add_argument("--files-dir", help="папка вложений; по умолчанию files/ рядом с базой")
     s.add_argument("--file-max-mb", type=float, default=FILE_MAX / (1 << 20))
     s.add_argument("--files-quota-mb", type=float, default=FILES_QUOTA / (1 << 20))
+    s.add_argument("--url", default="", help="адрес страницы для ссылок в Telegram, https://…:9447")
+    s.add_argument("--tg-token-file", help="бот Пульта для вестей о сессиях ИИ и ответов на них; "
+                                           "по умолчанию $CREDENTIALS_DIRECTORY/tg, если он есть")
+    s.add_argument("--tg-api", default=TELEGRAM_API)
     dg = sub.add_parser("digest", help="утренняя сводка: напечатать или отправить в Telegram")
     dg.add_argument("--db", default="/var/lib/pult/pult.db")
     dg.add_argument("--url", required=True, help="адрес страницы для ссылок, https://…:9447")

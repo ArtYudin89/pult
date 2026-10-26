@@ -77,6 +77,10 @@ FIELD_RU = {"project": "проект", "title": "название", "status": "�
             "effort": "усилие ИИ", "comment": "запись в журнал"}
 TEXT_FIELDS = ("title", "next", "wait", "notes", "mem", "prompt", "model", "effort")
 AI_FROM = {"task": "в карточке", "project": "из проекта", "area": "из раздела", "pult": "для всего Пульта"}
+RUN_RU = {"queued": "в очереди", "started": "запускается", "working": "идёт", "blocked": "ждёт разрешения на ПК",
+          "asked": "ждёт ответа", "done": "готово", "failed": "ошибка", "stopped": "остановлена",
+          "cancelled": "отменена"}
+RUN_LIVE = ("queued", "started", "working", "blocked", "asked")
 NO_STEPS = "поля «Шаги» больше нет: план пишите в описание (notes)"
 DATE_FIELDS = ("check", "due", "done_on")
 FOLD = str.maketrans("авсенкмортхуё", "abcehkmoptxye")
@@ -436,6 +440,12 @@ def cmd_brief(cfg, args):
     elif args.area:
         scope = " · " + v.areas[args.area]["name"]
     print(f"Пульт · {ddmm(st['today'])}{scope} · открытых {open_n} · {cfg['url']}")
+    live = [t for t in v.ordered(tasks) if (t.get("run") or {}).get("status") in RUN_LIVE]
+    if live:
+        print(f"Сессии ИИ ({len(live)}) — их ведёт исполнитель, вручную не браться")
+        for t in live:
+            print("  " + v.line(t, project=not args.project, width=0 if scoped else 160)
+                  + f" · сессия: {RUN_RU[t['run']['status']]}")
     asks = [t for t in v.ordered(tasks) if t.get("prompt") and v.is_open(t)]
     if asks:
         print(f"Сообщения для ИИ ({len(asks)}) — поручения людей, начать с них")
@@ -543,6 +553,18 @@ def cmd_show(cfg, args):
         print("Описание:")
         for line in t["notes"].splitlines():
             print("  " + line)
+    if r.get("runs"):
+        print("Сессии ИИ (новое сверху):")
+        for x in r["runs"][:5]:
+            bits = [f"#{x['id']} {RUN_RU.get(x['status'], x['status'])}", stamp(x["created_at"]),
+                    v.actor(x["executor"]), x["model"], x["effort"] and "усилие " + x["effort"],
+                    x["spent"] is not None and f"{x['spent']:g}% недели", x["reason"]]
+            print("  " + " · ".join(str(b) for b in bits if b))
+            for label, text in (("поручение", x["message"]), ("вопрос", x["question"]),
+                                ("ответ", x["result"] if x["status"] != "asked" else "")):
+                if text:
+                    one = " / ".join(text.splitlines())
+                    print(f"    {label}: {one if len(one) <= 300 else one[:299] + '…'}")
     if r.get("files"):
         print("Вложения (скачать — pult.py fetch НОМЕР):")
         for f in r["files"]:

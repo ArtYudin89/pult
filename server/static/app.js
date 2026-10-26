@@ -158,7 +158,8 @@
       if (card && mode === "view" && !$("drawer").hidden) {
         const t = S.tasks.find(x => x.key === card.task.key);
         const busy = [...$("drawer").querySelectorAll("textarea, input.inp")].some(x => x.value.trim() || x === document.activeElement);
-        if (t && t.version !== card.task.version && !busy) reloadCard();
+        const r0 = card.runs && card.runs[0], runMoved = t && t.run && (!r0 || r0.id !== t.run.id || r0.status !== t.run.status || RUN_ACTIVE.includes(r0.status));
+        if (t && (t.version !== card.task.version || runMoved) && !busy) reloadCard();
       }
     } catch (e) { /* тихо: следующая попытка через минуту */ }
   }
@@ -239,17 +240,76 @@
       '<label class="f"><span>Усилие ИИ</span><input class="inp mono" name="effort" list="ai-efforts" maxlength="60" value="' + esc(own.effort || "") + '" placeholder="' + esc(ph("effort", "не задано")) + '" autocomplete="off" spellcheck="false"></label></div>' + AI_LISTS;
   }
   const scopeKey = r => r.view === "all" ? "pult" : r.view === "a" || r.view === "p" ? r.view + ":" + r.id : null;
+
+  // ---------- сессии ИИ по карточкам ----------
+  const RUN_RU = {queued: "в очереди", started: "запускается", working: "идёт", blocked: "ждёт разрешения на ПК",
+    asked: "ждёт ответа", done: "готово", failed: "ошибка", stopped: "остановлена", cancelled: "отменена"};
+  const RUN_ACTIVE = ["queued", "started", "working", "blocked"];
+  const runLive = st => RUN_ACTIVE.includes(st) || st === "asked";
+  const short = (text, n) => { text = String(text || "").replace(/\s+/g, " ").trim(); return text.length > n ? text.slice(0, n - 1) + "…" : text; };
+  const fmtPct = x => x == null ? "?" : String(Math.round(x * 10) / 10).replace(".", ",") + "%";
+  const tsStamp = sec => { const d = new Date(sec * 1000); return String(d.getDate()).padStart(2, "0") + "." + String(d.getMonth() + 1).padStart(2, "0") + " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); };
+  const myModels = () => S.actors.filter(a => a.kind === "model" && a.active && a.owner === S.me.id);
+  const runMins = r => { const a = r.started_at ? new Date(r.started_at) : null, b = r.finished_at ? new Date(r.finished_at) : new Date(); return a ? Math.max(0, Math.round((b - a) / 60000)) : null; };
+  const hasLiveRuns = () => !!S && S.tasks.some(t => t.run && RUN_ACTIVE.includes(t.run.status));
+
+  function weekLine(exId) {
+    const r = (S.runners || {})[exId], s = S.ai || {};
+    const seen = r ? (r.online ? "исполнитель в сети" : "исполнитель не в сети с " + stamp(r.seen)) : "исполнитель ещё не запускался";
+    const week = r && r.week != null ? "неделя израсходована на " + fmtPct(r.week) + (r.week_resets ? " (сброс " + tsStamp(r.week_resets) + ")" : "") + (r.usage_at ? ", данные " + tsStamp(r.usage_at) : "") : "расход недели станет известен с первой сессией";
+    return seen + " · " + week + " · потолок " + fmtPct(s.ceiling);
+  }
+
+  function runFormHTML(t) {
+    const models = myModels(), ai = aiPick(aiChain("task", t)), s = S.ai || {};
+    const opts = models.map(m => { const r = (S.runners || {})[m.id]; return '<option value="' + esc(m.id) + '">' + esc(m.name) + (r && r.online ? " — в сети" : " — не в сети") + '</option>'; }).join("");
+    return '<form class="form" data-form="run" novalidate><h2>Передать в работу ИИ</h2>' +
+      '<label class="f"><span>Кто выполнит</span><select class="sel" name="executor">' + opts + '</select></label>' +
+      '<p class="hint" id="run-week">' + esc(models.length ? weekLine(models[0].id) : "") + '</p>' +
+      '<div class="row2"><label class="f"><span>Модель</span><input class="inp mono" name="model" list="ai-models" maxlength="60" value="' + esc(ai.model) + '" placeholder="по умолчанию" autocomplete="off" spellcheck="false"></label>' +
+      '<label class="f"><span>Усилие</span><input class="inp mono" name="effort" list="ai-efforts" maxlength="60" value="' + esc(ai.effort) + '" placeholder="по умолчанию" autocomplete="off" spellcheck="false"></label></div>' + AI_LISTS +
+      '<label class="f"><span>Что сделать</span><textarea class="ta" name="message" maxlength="4000" rows="4" placeholder="поручение: с него начнётся сессия">' + esc(t.prompt || "") + '</textarea></label>' +
+      '<details class="f"><summary>Описание карточки — ИИ прочтёт и его</summary><textarea class="ta" name="notes" maxlength="20000" rows="6">' + esc(t.notes || "") + '</textarea></details>' +
+      '<div class="row2"><label class="f"><span>Бюджет, % недели</span><input class="inp" name="budget" inputmode="decimal" value="' + esc(String(s.budget != null ? s.budget : 3).replace(".", ",")) + '" autocomplete="off"></label>' +
+      '<label class="f"><span>Время, минут</span><input class="inp" name="minutes" inputmode="numeric" value="' + esc(String(s.minutes != null ? s.minutes : 60)) + '" autocomplete="off"></label></div>' +
+      '<p class="hint">Вышло время или бюджет — сессия останавливается, разговор сохраняется: продолжить можно ответом. Процент недели общий для аккаунта — в него попадает и ваша работа в это время.</p>' +
+      '<div class="formbar"><button class="btn primary" type="submit">Передать в работу</button><button class="btn" type="button" data-askonly>Только оставить сообщение</button><button class="btn" type="button" data-cancel>Отмена</button></div></form>';
+  }
+
+  function runsHTML(t, can) {
+    const runs = card.runs || [];
+    if (!runs.length) return "";
+    const r = runs[0], mins = runMins(r), canRun = can && myModels().some(m => m.id === r.executor);
+    const meta = [actorName(r.executor), r.model, r.effort ? "усилие " + r.effort : "", mins != null ? mins + " мин" : "",
+      r.spent != null ? fmtPct(r.spent) + " недели" : ""].filter(Boolean).join(" · ");
+    let h = '<section class="runbox run-' + r.status + '"><h3 class="subhead">Сессия ИИ</h3><p class="runhead"><span class="pill run-' + r.status + '">' + RUN_RU[r.status] + '</span><span class="muted">' + esc(meta) + '</span></p>';
+    if (r.reason) h += '<p class="muted">' + esc(r.reason) + '</p>';
+    if (r.status === "asked" && r.question) h += '<p class="notes runq">' + linkify(r.question) + '</p>';
+    else if (r.status === "blocked" && r.bg) h += '<p class="hint">Ждёт разрешения на том компьютере: <span class="mono">claude attach ' + esc(r.bg) + '</span></p>';
+    if (r.result && r.status !== "asked") h += '<details' + (r.status === "done" ? " open" : "") + '><summary>Последний ответ сессии</summary><p class="notes">' + linkify(r.result) + '</p></details>';
+    if (canRun && RUN_ACTIVE.includes(r.status)) h += '<div class="actions"><button class="btn small" type="button" data-runstop="' + r.id + '"' + (r.stop_requested ? " disabled" : "") + '>' + (r.stop_requested ? "Останавливается…" : r.status === "queued" ? "Отменить" : "Остановить") + '</button></div>';
+    else if (canRun && r.status !== "cancelled") h += '<form class="comment" data-form="runreply" data-runid="' + r.id + '"><textarea class="ta short" name="message" maxlength="4000" placeholder="' + (r.status === "asked" ? "ответ на вопрос" : "что дальше — продолжит ту же сессию") + '" aria-label="Ответ в сессию"></textarea><div><button class="btn small primary" type="submit">Продолжить сессию</button></div></form>';
+    if (runs.length > 1) h += '<details><summary>Прошлые запуски · ' + (runs.length - 1) + '</summary><ul class="plist">' + runs.slice(1).map(x => '<li><span class="pill run-' + x.status + '">' + RUN_RU[x.status] + '</span><span class="grow">' + esc(short(x.message, 90)) + '</span><span class="hint">' + esc(stamp(x.created_at)) + '</span></li>').join("") + '</ul></details>';
+    return h + '</section>';
+  }
   // строка «ИИ: …» в шапке раздела, проекта или всех задач; владелец меняет её на месте
   function aiHead(kind, x) {
     const key = kind === "pult" ? "pult" : (kind === "area" ? "a:" : "p:") + x.id;
     const own = kind === "pult" ? (S.ai || {}) : x;
+    const s = S.ai || {}, num = (n, d) => esc(String(s[n] != null ? s[n] : d).replace(".", ","));
     if (aiEdit === key && OWNER) {
-      return '<form class="aiform" data-form="ai" data-scope="' + esc(key) + '" novalidate>' + aiInputs(kind, own, aiPick(aiChain(kind, x).slice(1))) +
+      const limits = kind !== "pult" ? "" : '<div class="row3">' +
+        '<label class="f"><span>Бюджет запуска, % недели</span><input class="inp" name="budget" inputmode="decimal" value="' + num("budget", 3) + '" autocomplete="off"></label>' +
+        '<label class="f"><span>Время запуска, минут</span><input class="inp" name="minutes" inputmode="numeric" value="' + num("minutes", 60) + '" autocomplete="off"></label>' +
+        '<label class="f"><span>Потолок недели, %</span><input class="inp" name="ceiling" inputmode="decimal" value="' + num("ceiling", 80) + '" autocomplete="off"></label></div>' +
+        '<p class="hint">Бюджет и время — значения по умолчанию в окне «Выполнить». Потолок: неделя израсходована больше — исполнитель не запускает новые сессии и останавливает идущую.</p>';
+      return '<form class="aiform" data-form="ai" data-scope="' + esc(key) + '" novalidate>' + aiInputs(kind, own, aiPick(aiChain(kind, x).slice(1))) + limits +
         '<div class="formbar"><button class="btn primary small" type="submit">Сохранить</button><button class="btn small" type="button" data-aicancel>Отмена</button></div></form>';
     }
     const ai = aiPick(aiChain(kind, x)), shown = aiHTML(ai);
-    if (!shown && !OWNER) return "";
-    return '<p class="ai-line"><span class="muted">ИИ для сессий по карточкам:</span>' + (shown || '<span class="muted">не задано</span>') +
+    const lim = kind === "pult" ? '<span>запуск <span class="mono">' + fmtPct(s.budget) + '</span> недели, <span class="mono">' + esc(String(s.minutes)) + '</span> мин · потолок <span class="mono">' + fmtPct(s.ceiling) + '</span></span>' : "";
+    if (!shown && !lim && !OWNER) return "";
+    return '<p class="ai-line"><span class="muted">ИИ для сессий по карточкам:</span>' + (shown || '<span class="muted">модель и усилие не заданы</span>') + lim +
       (OWNER ? '<button class="linkbtn" type="button" data-aiedit="' + esc(key) + '">изменить</button>' : "") + '</p>';
   }
   // «Кто держит»: те, кто правит проект; владелец может назначить и остальных — с пометкой
@@ -329,7 +389,7 @@
   function trow(t, ts) {
     const p = PROJ[t.project], a = AREA_OF[t.project], st = stepText(t);
     const where = (a ? a.name + " › " : "") + (p ? p.name : t.project);
-    const extra = (t.prompt ? " · сообщение для ИИ" : "") +
+    const extra = (t.run && runLive(t.run.status) ? " · сессия ИИ: " + RUN_RU[t.run.status] : t.prompt ? " · сообщение для ИИ" : "") +
       (t.files ? " · " + t.files + " " + plural(t.files, "вложение", "вложения", "вложений") : "");
     return '<button class="trow' + (t.key === openKey ? " on" : "") + '" type="button" data-task="' + esc(t.key) + '"><span class="tid">' + hl(t.key, ts) + '</span>' +
       '<span class="tt"><span class="t">' + hl(t.title, ts) + '</span><span class="meta">' + hl(where + (st ? " · " + st : ""), ts) + esc(extra) + '</span></span>' +
@@ -420,7 +480,8 @@
 
   function bcard(t, ts, oneProject) {
     const p = PROJ[t.project];
-    const ask = t.prompt ? '<span title="Сообщение для ИИ">' + MSG + 'ИИ</span>' : "";
+    const ask = t.run && runLive(t.run.status) ? '<span class="runmark run-' + t.run.status + '" title="Сессия ИИ: ' + RUN_RU[t.run.status] + '">' + (t.run.status === "asked" ? "? ИИ ждёт" : t.run.status === "queued" ? "ИИ в очереди" : "▶ ИИ") + '</span>'
+      : t.prompt ? '<span title="Сообщение для ИИ">' + MSG + 'ИИ</span>' : "";
     const files = t.files ? '<span title="Вложения">' + CLIP + t.files + '</span>' : "";
     return '<button class="bcard' + (isLate(t) ? " late" : "") + (isOpen(t) ? "" : " closed") + (t.key === openKey ? " on" : "") + '" type="button" data-task="' + esc(t.key) + '"' + (canEdit(t.project) ? " data-drag" : "") + '>' +
       '<span class="bc-top"><span class="tid">' + hl(t.key, ts) + '</span>' + dateChip(t) + '</span>' +
@@ -877,6 +938,14 @@
     }
     h += '</section>';
     h += u.kind === "person" ? loginHTML(u, mine) : keysHTML(u, manage);
+    if (u.kind === "person" && (mine || OWNER)) {
+      const tg = u.telegram;
+      h += '<section><h3 class="subhead">Telegram</h3>' + (tg
+        ? '<p class="notes">Привязан' + (tg.user ? " — @" + esc(tg.user) : "") + ", " + esc(stamp(tg.at)) + '. Сюда приходят вести о сессиях ИИ; ответ на сообщение продолжает ту же сессию.</p>'
+        : '<p class="muted">Не привязан: вести о сессиях ИИ не приходят.</p>') +
+        '<div class="actions" id="tg-link">' + (mine ? '<button class="btn small" type="button" data-tglink>' + (tg ? "Привязать заново" : "Привязать Telegram") + '</button>' : "") +
+        (tg ? '<button class="btn small" type="button" data-tgunlink>Отвязать</button>' : "") + '</div></section>';
+    }
     if (u.kind === "person") {
       const ms = P.people.filter(x => x.owner === u.id);
       if (ms.length || (mine && S.me.kind === "person")) {
@@ -1023,6 +1092,7 @@
   function cardHTML() {
     const t = card.task, p = PROJ[t.project], a = AREA_OF[t.project], can = canEdit(t.project);
     if (mode === "edit" && can) return drawerHead(t.key) + '<div class="task">' + formHTML(t, false) + '</div>';
+    if (mode === "run" && can) return drawerHead(t.key) + '<div class="task">' + runFormHTML(t) + '</div>';
     const statusbar = can
       ? '<span class="statusbar" role="group" aria-label="Статус">' + STATUS_ORDER.map(s => '<button class="sbtn ' + s + '" type="button" data-status="' + s + '" aria-pressed="' + (t.status === s) + '"><i class="lamp ' + s + '"></i>' + STATUS[s] + '</button>').join("") + '</span>'
       : '<span class="pill ' + t.status + '"><i class="lamp ' + t.status + '"></i>' + STATUS[t.status] + '</span>';
@@ -1045,16 +1115,18 @@
 
     const pass = passOpen && can ? '<div class="picker" role="group" aria-label="Кому передать">' + holderChoices(t.project, t.holder).map(({a: x, noacc}) => '<button class="chipbtn' + (noacc ? " noacc" : "") + '" type="button" data-holder="' + esc(x.id) + '" aria-pressed="' + (t.holder === x.id) + '"' + (noacc ? ' title="Не правит этот проект: задачу не увидит"' : "") + '>' + av(x.id) + esc(x.name) + (noacc ? " · нет доступа" : "") + '</button>').join("") +
       '<button class="chipbtn" type="button" data-holder="" aria-pressed="' + !t.holder + '">никто</button></div>' : "";
+    const live = card.runs && card.runs[0] && RUN_ACTIVE.includes(card.runs[0].status);
+    const runBtn = S.me.kind === "person" && myModels().length && !live ? '<button class="btn primary" type="button" data-run>Выполнить</button>' : "";
     const acts = can
-      ? '<div class="actions">' + (t.holder !== S.me.id ? '<button class="btn primary" type="button" data-take>Взять себе</button>' : "") +
+      ? '<div class="actions">' + runBtn + (t.holder !== S.me.id ? '<button class="btn' + (runBtn ? "" : " primary") + '" type="button" data-take>Взять себе</button>' : "") +
         '<button class="btn" type="button" data-pass aria-expanded="' + passOpen + '">Передать</button><button class="btn" type="button" data-edit>Изменить</button><button class="btn" type="button" data-copy>Ссылка</button></div>' + pass
       : '<div class="actions"><button class="btn" type="button" data-copy>Ссылка</button><span class="muted">Только чтение: права править задачи этого проекта у вас нет.</span></div>';
-    const ask = t.prompt ? '<section class="ask"><h3 class="subhead">' + MSG + 'Сообщение для ИИ</h3><p class="notes">' + linkify(t.prompt) + '</p></section>' : "";
+    const ask = t.prompt ? '<section class="ask"><h3 class="subhead">' + MSG + 'Сообщение для ИИ' + (can ? '<button class="linkbtn" type="button" data-askclear>убрать</button>' : "") + '</h3><p class="notes">' + linkify(t.prompt) + '</p></section>' : "";
     const notes = t.notes ? '<section><h3 class="subhead">Описание</h3><p class="notes">' + linkify(t.notes) + '</p></section>' : "";
     const comment = can ? '<form class="comment" data-form="comment"><textarea class="ta short" name="text" maxlength="4000" placeholder="Запись в журнал: что сделано, что решили" aria-label="Запись в журнал"></textarea><div><button class="btn small" type="submit">Записать в журнал</button></div></form>' : "";
     const jr = card.journal.length ? '<ol class="journal">' + card.journal.map(e => '<li>' + av(e.actor) + '<div>' + jentry(e, false) + '</div></li>').join("") + '</ol>' : '<p class="muted">Записей пока нет.</p>';
     return drawerHead(t.key) + '<div class="task"><div class="task-top"><div class="crumbs">' + (a ? esc(a.name) + ' › ' : "") + esc(p ? p.name : t.project) + '</div><h2>' + esc(t.title) + '</h2></div>' +
-      f + acts + ask + notes + filesHTML(can) + '<section><h3 class="subhead">Журнал</h3>' + comment + '</section>' + jr + '</div>';
+      f + acts + runsHTML(t, can) + ask + notes + filesHTML(can) + '<section><h3 class="subhead">Журнал</h3>' + comment + '</section>' + jr + '</div>';
   }
 
   function formHTML(t, isNew) {
@@ -1074,11 +1146,9 @@
       '<div class="row2"><label class="f"><span>Держит</span><select class="sel" name="holder">' + holderOpts + '</select></label>' +
       '<label class="f"><span>Срок</span><input class="inp" type="date" name="due" value="' + esc(t.due || "") + '"></label></div>' +
       '<label class="f"><span>Следующий шаг</span><textarea class="ta short" name="next" maxlength="500">' + esc(t.next || "") + '</textarea></label>' +
-      '<label class="f"><span>Сообщение для ИИ</span><textarea class="ta short" name="prompt" maxlength="4000" placeholder="что сделать ИИ, который возьмёт карточку: прочтёт первым в начале сессии">' + esc(t.prompt || "") + '</textarea></label>' +
       '<div class="row2"><label class="f"><span>Ждём</span><input class="inp" name="wait" maxlength="500" value="' + esc(t.wait || "") + '" placeholder="кого или чего" autocomplete="off"></label>' +
       '<label class="f"><span>Проверить</span><input class="inp" type="date" name="check" value="' + esc(t.check || "") + '"></label></div>' +
       '<label class="f"><span>Описание</span><textarea class="ta" name="notes" maxlength="20000" rows="6">' + esc(t.notes || "") + '</textarea></label>' +
-      aiInputs("task", t, aiPick(aiChain("project", PROJ[t.project] || null))) +
       '<label class="f"><span>Подробности</span><input class="inp mono" name="mem" maxlength="500" value="' + esc(t.mem || "") + '" placeholder="файл памяти или папка" autocomplete="off"></label>' +
       '<label class="f"><span>Запись в журнал</span><input class="inp" name="comment" maxlength="4000" placeholder="необязательно: почему меняем" autocomplete="off"></label>' +
       '<div class="formbar"><button class="btn primary" type="submit">' + (isNew ? "Создать" : "Сохранить") + '</button><button class="btn" type="button" data-cancel>Отмена</button><span class="spacer"></span>' +
@@ -1090,8 +1160,7 @@
     return {
       title: v("title").trim(), project: v("project"), status: v("status"), holder: v("holder") || null,
       due: v("due") || null, next: v("next").trim(), wait: v("wait").trim(), check: v("check") || null,
-      notes: v("notes").trim(), mem: v("mem").trim(), prompt: v("prompt").trim(), model: v("model").trim(),
-      effort: v("effort").trim(), comment: v("comment").trim()
+      notes: v("notes").trim(), mem: v("mem").trim(), comment: v("comment").trim()
     };
   }
 
@@ -1121,10 +1190,30 @@
     const f = readForm(form), t = card.task, body = {};
     if (!f.title) { toast("Нужно название", true); form.elements.title.focus(); return; }
     const same = (x, y) => (x == null ? "" : x) === (y == null ? "" : y);
-    ["title", "project", "status", "holder", "due", "next", "wait", "check", "notes", "mem", "prompt", "model", "effort"].forEach(k => { if (!same(f[k], t[k])) body[k] = f[k]; });
+    ["title", "project", "status", "holder", "due", "next", "wait", "check", "notes", "mem"].forEach(k => { if (!same(f[k], t[k])) body[k] = f[k]; });
     if (f.comment) body.comment = f.comment;
     if (!Object.keys(body).length) { mode = "view"; renderCard(); return; }
     await busy(form, patchTask(body, "Сохранено"));
+  }
+
+  // «Передать в работу» — заявка исполнителю; askOnly — только оставить сообщение для следующей сессии ИИ
+  async function saveRun(form, askOnly) {
+    const t = card.task, v = n => form.elements[n] ? form.elements[n].value.trim() : "";
+    const message = v("message"), ai = aiPick(aiChain("task", t)), body = {version: t.version};
+    if (!message) { toast("Напишите, что сделать", true); form.elements.message.focus(); return; }
+    if (v("model") !== (ai.model || "")) body.model = v("model");
+    if (v("effort") !== (ai.effort || "")) body.effort = v("effort");
+    if (v("notes") !== (t.notes || "").trim()) body.notes = v("notes");
+    if (askOnly) {
+      await busy(form, patchTask(Object.assign(body, {prompt: message}), "Сообщение оставлено: его прочтёт следующая сессия ИИ"));
+      return;
+    }
+    Object.assign(body, {executor: v("executor"), message, budget: v("budget"), minutes: v("minutes")});
+    await busy(form, api("POST", "/api/task/" + encodeURIComponent(t.key) + "/run", body).then(r => {
+      mode = "view"; card.task = r.task;
+      applyTask(Object.assign({}, r.task, {run: {id: r.run.id, status: r.run.status}}));
+      return reloadCard().then(() => toast("Передано в работу: " + actorName(r.run.executor)));
+    }, e => toast(e.message, true)));
   }
 
   async function saveNew(form) {
@@ -1151,7 +1240,7 @@
       const ok = id => PROJ[id] && canEdit(id);
       const r = route.view === "board" ? (splitScope(route.id) || {view: "all"}) : route;
       const pid0 = r.view === "p" && ok(r.id) ? r.id : r.view === "a" && AREA[r.id] ? ((visibleProjects(AREA[r.id]).find(p => canEdit(p.id)) || {}).id || "") : "";
-      newDefaults = {project: pid0, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: "", prompt: "", model: "", effort: ""};
+      newDefaults = {project: pid0, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: ""};
     }
     openKey = null; card = null; mode = "new"; ++cardSeq;
     pid = null; pcard = null; secret = null;
@@ -1163,7 +1252,7 @@
 
   function newTask(projectId) {
     newDefaults = null;
-    if (projectId && PROJ[projectId]) newDefaults = {project: projectId, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: "", prompt: "", model: "", effort: ""};
+    if (projectId && PROJ[projectId]) newDefaults = {project: projectId, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: ""};
     location.hash = hashFor(route, "new");
   }
 
@@ -1240,7 +1329,7 @@
 
   // ---------- события ----------
 
-  const CLICKS = "[data-nav],[data-task],[data-close],[data-reset],[data-more-closed],[data-status],[data-take],[data-pass],[data-holder],[data-edit],[data-cancel],[data-copy],[data-del],[data-rmrow],[data-aiedit],[data-aicancel],[data-logactor],[data-new],[data-me],[data-logout]," +
+  const CLICKS = "[data-nav],[data-task],[data-close],[data-reset],[data-more-closed],[data-status],[data-take],[data-pass],[data-holder],[data-edit],[data-cancel],[data-copy],[data-del],[data-rmrow],[data-aiedit],[data-aicancel],[data-run],[data-askonly],[data-askclear],[data-runstop],[data-tglink],[data-tgunlink],[data-logactor],[data-new],[data-me],[data-logout]," +
     "[data-person],[data-pnew],[data-ungrant],[data-role],[data-revoke-key],[data-revoke-invite],[data-copy-secret],[data-pedit],[data-active],[data-addgrant],[data-board],[data-attach],[data-fdel]";
 
   document.addEventListener("click", ev => {
@@ -1306,6 +1395,30 @@
       if (m) m.focus();
     } else if (d.aicancel !== undefined) {
       aiEdit = null; renderMain();
+    } else if (d.run !== undefined && card) {
+      etag = null;  // свежее «в сети» исполнителя и расход недели
+      refresh(true).then(() => {
+        mode = "run"; renderCard();
+        const m = $("drawer").querySelector('textarea[name="message"]');
+        if (m) m.focus();
+      });
+    } else if (d.askonly !== undefined && card) {
+      saveRun(el.closest("form"), true);
+    } else if (d.askclear !== undefined && card) {
+      patchTask({prompt: ""}, "Сообщение убрано");
+    } else if (d.runstop !== undefined && card) {
+      el.disabled = true;
+      api("POST", "/api/run/" + d.runstop + "/stop", {}).then(() => { etag = null; return reloadCard(); })
+        .then(() => toast("Сессию остановят"), e => { el.disabled = false; toast(e.message, true); });
+    } else if (d.tglink !== undefined && pcard) {
+      el.disabled = true;
+      api("POST", "/api/actor/" + encodeURIComponent(pcard.id) + "/telegram", {}).then(r => {
+        const box = $("tg-link");
+        if (box) box.innerHTML = '<a class="btn primary" href="' + esc(r.link) + '" target="_blank" rel="noopener">Открыть @' + esc(r.bot) + ' и нажать Start</a><span class="hint">Ссылка одноразовая, действует ' + r.hours + ' ч. После Start обновите страницу.</span>';
+      }, e => { el.disabled = false; toast(e.message, true); });
+    } else if (d.tgunlink !== undefined && pcard) {
+      if (!confirmed(el, "Точно?")) return;
+      personAct(api("DELETE", "/api/actor/" + encodeURIComponent(pcard.id) + "/telegram"), "Telegram отвязан");
     } else if (d.copy !== undefined && card) {
       copyText(location.origin + "/#t=" + encodeURIComponent(card.task.key));
     } else if (d.del !== undefined && card) {
@@ -1369,8 +1482,16 @@
       busy(form, api("POST", "/api/task/" + encodeURIComponent(card.task.key) + "/comment", {text})
         .then(r => { card.task = r.task; applyTask(r.task); return reloadCard(); })
         .then(() => toast("Записано в журнал"), e => toast(e.message, true)));
+    } else if (kind === "run" && card) saveRun(form, false);
+    else if (kind === "runreply" && card) {
+      const text = form.elements.message.value.trim();
+      if (!text) { toast("Напишите ответ", true); return; }
+      busy(form, api("POST", "/api/run/" + form.dataset.runid + "/reply", {message: text}).then(r => {
+        card.task = r.task; applyTask(Object.assign({}, r.task, {run: {id: r.run.id, status: r.run.status}})); return reloadCard();
+      }).then(() => toast("Передано: сессия продолжится"), e => toast(e.message, true)));
     } else if (kind === "ai") {
       const scope = form.dataset.scope, body = {model: form.elements.model.value.trim(), effort: form.elements.effort.value.trim()};
+      if (scope === "pult") ["budget", "minutes", "ceiling"].forEach(k => { body[k] = form.elements[k].value.trim(); });
       const path = scope === "pult" ? "/api/settings" : "/api/" + (scope[0] === "a" ? "area/" : "project/") + encodeURIComponent(scope.slice(2));
       busy(form, api("PATCH", path, body).then(() => { aiEdit = null; etag = null; return refresh(true); })
         .then(() => { if (card && mode === "view" && !$("drawer").hidden) renderCard(); toast("Сохранено"); }, e => toast(e.message, true)));
@@ -1513,6 +1634,14 @@
     if (document.visibilityState === "visible" && S && !gate && Date.now() - lastFetch > 15000) refresh();
   });
   setInterval(() => { if (document.visibilityState === "visible" && S && !gate) refresh(); }, 60000);
+  // пока идёт сессия ИИ — смотреть чаще: состояние карточки меняет исполнитель
+  setInterval(() => { if (document.visibilityState === "visible" && S && !gate && hasLiveRuns()) refresh(); }, 10000);
+  document.addEventListener("change", ev => {
+    if (ev.target.matches && ev.target.matches('form[data-form="run"] select[name="executor"]')) {
+      const w = $("run-week");
+      if (w) w.textContent = weekLine(ev.target.value);
+    }
+  });
 
   (async () => {
     try { await loadState(true); }

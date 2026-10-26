@@ -7,12 +7,14 @@ Wants=network-online.target
 Type=simple
 User=pult
 Group=pult
-ExecStart=/usr/bin/python3 /opt/pult/pult_server.py serve --db /var/lib/pult/pult.db --static /opt/pult/static --port @PORT@ --backup-dir /var/lib/pult/backup@PLAIN@
+ExecStart=/usr/bin/python3 /opt/pult/pult_server.py serve --db /var/lib/pult/pult.db --static /opt/pult/static --port @PORT@ --backup-dir /var/lib/pult/backup --url @URL@@PLAIN@
 # Сертификат и ключ systemd отдаёт копией в $CREDENTIALS_DIRECTORY, поэтому служба не стартует от root
 # и сами файлы ей не видны. Без сертификата (PULT_CERT пуст) служба слушает только 127.0.0.1 без TLS
 # с ключом --proxy: наружу её отдаёт обратный прокси с HTTPS.
 @TLS@LoadCredential=cert:@CERT@
 @TLS@LoadCredential=key:@KEY@
+# Токен бота Пульта (PULT_TG_TOKEN_FILE): вести о сессиях ИИ и ответы на них; тот же бот шлёт сводку.
+@BOT@LoadCredential=tg:@TG@
 Restart=always
 RestartSec=3
 # Перезапуск раз в 12 ч подхватывает продлённый сертификат; входы на страницах не теряются.
@@ -41,7 +43,7 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

@@ -33,13 +33,15 @@ import pult as cli  # noqa: E402
 # у проекта и раздела — модель и усилие, в /api/state — ai всего Пульта. Поля «Шаги» нет: при переходе его
 # пункты дописаны в конец описания, версия карточки и rev выросли на 1 — as_after_move() делает то же
 # со старым ответом, а остальное должно совпасть.
-NEW_TOP = {"limits", "ai"}
+# Схема 5: сессии ИИ — в /api/state исполнители (runners) и у задачи последняя сессия (run), у карточки —
+# список сессий (runs); в ai — ещё пределы запуска.
+NEW_TOP = {"limits", "ai", "runners"}
 NEW_ACTOR = set()
 NEW_AREA = {"model", "effort"}
 NEW_PROJECT = {"model", "effort"}
 NEW_JOURNAL = set()
-NEW_TASK = {"files", "prompt", "model", "effort"}
-NEW_CARD = {"files"}
+NEW_TASK = {"files", "prompt", "model", "effort", "run"}
+NEW_CARD = {"files", "runs"}
 NEW_CARD_TASK = {"ai"}
 GONE_TASK = {"checklist"}
 

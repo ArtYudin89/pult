@@ -52,7 +52,8 @@ done
 
 render() {  # шаблон deploy/<юнит>.in → /etc/systemd/system/<юнит>
     if [ -n "$PULT_CERT" ]; then tls='s|^@TLS@||'; plain=''; else tls='/^@TLS@/d'; plain=' --proxy'; fi
-    sed -e "$tls" -e "s|@PLAIN@|$plain|" -e "s|@PORT@|$PULT_PORT|g" -e "s|@CERT@|$PULT_CERT|g" \
+    if [ -n "$PULT_TG_TOKEN_FILE" ]; then bot='s|^@BOT@||'; else bot='/^@BOT@/d'; fi
+    sed -e "$tls" -e "$bot" -e "s|@PLAIN@|$plain|" -e "s|@PORT@|$PULT_PORT|g" -e "s|@CERT@|$PULT_CERT|g" \
         -e "s|@KEY@|$PULT_KEY|g" -e "s|@URL@|$PULT_URL|g" -e "s|@TG@|$PULT_TG_TOKEN_FILE|g" \
         -e "s|@DIGEST_AT@|$PULT_DIGEST_AT|g" "$SRC/deploy/$1.in" > "/etc/systemd/system/$1"
     chmod 0644 "/etc/systemd/system/$1"

@@ -227,8 +227,9 @@ class PlainHttp(Base):
         self.assertEqual(r["journal"][0]["changes"], [f"Сообщение для ИИ: «{ask}»", "Усилие ИИ: high"],
                          "поручение — в журнал целиком, без сокращения")
         # уровни: весь Пульт → раздел → проект → карточка; нижний главнее
-        self.assertEqual(self.api("PATCH", "/api/settings", {"model": "claude-sonnet-5-5", "effort": "medium"},
-                                  who="artem")["ai"], {"model": "claude-sonnet-5-5", "effort": "medium"})
+        ai = self.api("PATCH", "/api/settings", {"model": "claude-sonnet-5-5", "effort": "medium"}, who="artem")["ai"]
+        self.assertEqual((ai["model"], ai["effort"], ai["budget"], ai["minutes"], ai["ceiling"]),
+                         ("claude-sonnet-5-5", "medium", 3.0, 60, 80.0), "пределы запуска — по умолчанию")
         self.api("PATCH", "/api/area/1c", {"model": "claude-opus-5-5"}, who="artem")
         self.assertEqual(self.api("GET", "/api/task/1C-1")["task"]["ai"],
                          {"model": "claude-opus-5-5", "model_from": "area", "effort": "high", "effort_from": "task"})
@@ -238,7 +239,11 @@ class PlainHttp(Base):
                          {"model": "claude-fable-5-1", "model_from": "project", "effort": "max", "effort_from": "project"})
         self.assertEqual(self.api("GET", "/api/task/1C-1")["journal"][0]["changes"], ["Усилие ИИ: как у проекта"])
         st = self.api("GET", "/api/state")
-        self.assertEqual(st["ai"], {"model": "claude-sonnet-5-5", "effort": "medium"})
+        self.assertEqual((st["ai"]["model"], st["ai"]["effort"]), ("claude-sonnet-5-5", "medium"))
+        for bad in ({"budget": 0}, {"minutes": "много"}, {"ceiling": 101}):
+            with self.assertRaises(cli.PultError, msg=bad) as ctx:
+                self.api("PATCH", "/api/settings", bad, who="artem")
+            self.assertEqual(ctx.exception.status, 400, bad)
         self.assertEqual({p["id"]: (p["model"], p["effort"]) for p in st["projects"]}["ms"], ("claude-fable-5-1", "max"))
         self.assertEqual({a["id"]: a["model"] for a in st["areas"]}["1c"], "claude-opus-5-5")
         self.assertEqual({x["key"]: x["prompt"] for x in st["tasks"]}["1C-1"], ask)
@@ -1119,6 +1124,340 @@ class Digest(Base):
 
 
 @unittest.skipUnless(shutil.which("openssl"), "нет openssl")
+class FakeBotApi(http.server.BaseHTTPRequestHandler):
+    """Bot API для бота Пульта: getMe, getUpdates (обновления кладёт тест), sendMessage с номерами сообщений."""
+    updates, sent, lock = [], [], threading.Lock()
+    next_update, next_msg = 1, 100
+
+    def do_POST(self):
+        params = {k: v[0] for k, v in urllib.parse.parse_qs(
+            self.rfile.read(int(self.headers["Content-Length"] or 0)).decode("utf-8")).items()}
+        method = self.path.rsplit("/", 1)[-1]
+        cls = FakeBotApi
+        if method == "getMe":
+            result = {"id": 1, "is_bot": True, "username": "test_pult_bot"}
+        elif method == "getUpdates":
+            offset = int(params.get("offset") or 0)
+            for _ in range(10):  # долгий опрос в миниатюре
+                with cls.lock:
+                    result = [u for u in cls.updates if u["update_id"] >= offset]
+                if result:
+                    break
+                time.sleep(0.05)
+        elif method == "sendMessage":
+            with cls.lock:
+                cls.next_msg += 1
+                cls.sent.append({"chat": params["chat_id"], "text": params["text"], "id": cls.next_msg})
+                result = {"message_id": cls.next_msg}
+        else:
+            result = {}
+        out = json.dumps({"ok": True, "result": result}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    @classmethod
+    def push(cls, message):
+        with cls.lock:
+            cls.updates.append({"update_id": cls.next_update, "message": message})
+            cls.next_update += 1
+
+    def log_message(self, *args):
+        pass
+
+
+def short_path(path):
+    """На Windows — путь без кириллицы (8.3): его выполняет оболочка в команде строки состояния."""
+    if os.name != "nt":
+        return path
+    import ctypes
+    buf = ctypes.create_unicode_buffer(1024)
+    return buf.value if ctypes.windll.kernel32.GetShortPathNameW(path, buf, 1024) else path
+
+
+class Runs(Base):
+    """Сессии ИИ по карточкам: «Выполнить», исполнитель с поддельным claude, пределы, остановка, Telegram."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tg = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeBotApi)
+        threading.Thread(target=cls.tg.serve_forever, daemon=True).start()
+        cls.tgdir = tempfile.mkdtemp(prefix="pult_tg_")
+        token_file = os.path.join(cls.tgdir, "bot.token")
+        with open(token_file, "w", encoding="utf-8") as f:
+            f.write("123456:" + "A" * 35 + "\n")
+        cls.serve_args = ("--tg-token-file", token_file, "--tg-api", f"http://127.0.0.1:{cls.tg.server_port}",
+                          "--url", "https://pult.test")
+        super().setUpClass()
+        cls.keys = cls.seed_tasks([{"project": "lab", "title": f"Карточка {i}", "status": "next"} for i in range(8)])
+        work = short_path(cls.tmp)
+        cls.fake = os.path.join(work, "fake")
+        cls.folder = os.path.join(work, "lab")
+        os.makedirs(cls.folder)
+        cls.renv = unittest.mock.patch.dict(os.environ, {"FAKE_CLAUDE_DIR": cls.fake, "PULT_RUNNER_TICK": "0.05",
+                                                          "PULT_RUNNER_DIR": os.path.join(work, "runner")})
+        cls.renv.start()
+        import importlib
+        sys.modules.pop("pult_runner", None)
+        cls.runner_mod = importlib.import_module("pult_runner")  # WORK и WATCH_SEC берутся при импорте
+        cls.rcfg = {"cli": cli, "pult": {"url": cls.url, "token": cls.tok["claude"], "session": ""},
+                    "base": work, "folders": {"lab": cls.folder}, "python": "python", "permission_mode": "auto",
+                    "claude": [sys.executable, "-X", "utf8", os.path.join(ROOT, "tests", "fake_claude.py")],
+                    "poll": 1}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.renv.stop()
+        cls.tg.shutdown()
+        super().tearDownClass()
+        shutil.rmtree(cls.tgdir, ignore_errors=True)
+
+    def runner(self):
+        return self.runner_mod.Runner(dict(self.rcfg))
+
+    def drive(self, runner, until, limit=80):
+        """Крутить исполнитель, пока сессия по заявке не придёт в нужное состояние."""
+        for _ in range(limit):
+            runner.tick()
+            st = self.run_of(until[0])
+            if st["status"] in until[1]:
+                return st
+        self.fail(f"сессия не дошла до {until[1]}: {self.run_of(until[0])}")
+
+    def run_of(self, key):
+        return self.api("GET", f"/api/task/{key}")["runs"][0]
+
+    def go(self, key, message, **extra):
+        return self.api("POST", f"/api/task/{key}/run", dict({"executor": "claude", "message": message}, **extra),
+                        who="artem")
+
+    def calls(self):
+        with open(os.path.join(self.fake, "calls.jsonl"), encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
+
+    def sent(self, needle, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            with FakeBotApi.lock:
+                hit = [m for m in FakeBotApi.sent if needle in m["text"]]
+            if hit:
+                return hit[-1]
+            time.sleep(0.05)
+        self.fail(f"бот не отправил «{needle}»: {[m['text'][:60] for m in FakeBotApi.sent]}")
+
+    def test_r1_done(self):
+        key = self.keys[0]
+        r = self.go(key, "[done] добавь поле", model="claude-sonnet-5-5", budget=2.5, minutes=30)
+        self.assertEqual((r["run"]["status"], r["run"]["model"], r["run"]["budget"], r["run"]["minutes"]),
+                         ("queued", "claude-sonnet-5-5", 2.5, 30))
+        t = self.api("GET", f"/api/task/{key}")
+        self.assertEqual((t["task"]["holder"], t["task"]["status"], t["task"]["model"]),
+                         ("claude", "doing", "claude-sonnet-5-5"))
+        e = t["journal"][0]
+        self.assertEqual(e["text"], "[done] добавь поле")
+        self.assertIn("Передано в работу: Claude · claude-sonnet-5-5 · усилие по умолчанию · бюджет 2,5% недели · "
+                      "30 мин", e["changes"])
+        st = self.api("GET", "/api/state")
+        self.assertEqual(next(x for x in st["tasks"] if x["key"] == key)["run"]["status"], "queued")
+        runner = self.runner()
+        runner.tick(hello=True)
+        done = self.drive(runner, (key, ("done",)))
+        self.assertIn("Сделано: поле добавлено", done["result"])
+        self.assertEqual((done["week_start"], done["week_now"], done["spent"]), (50.0, 50.3, 0.3))
+        self.assertTrue(done["session"] and done["bg"] and done["folder"] == self.folder)
+        bg = [c for c in self.calls() if "--bg" in c["argv"]][-1]
+        argv = bg["argv"]
+        self.assertEqual(os.path.normcase(bg["cwd"]), os.path.normcase(self.folder))
+        for a, b in (("--model", "claude-sonnet-5-5"), ("--permission-mode", "auto"),
+                     ("--disallowedTools", "AskUserQuestion"), ("-n", key)):
+            self.assertEqual(argv[argv.index(a) + 1], b)
+        self.assertNotIn("--resume", argv)
+        self.assertIn(f"show {key}", argv[-1])
+        self.assertIn("ВОПРОС:", argv[-1])
+        stopped = [c for c in self.calls() if c["argv"][:1] == ["stop"]]
+        self.assertTrue(stopped, "после ответа процесс сессии останавливают — разговор сохраняется")
+        j = self.api("GET", f"/api/task/{key}")["journal"][0]
+        self.assertTrue(j["changes"][0].startswith("Сессия ИИ: готово · "), j["changes"])
+        self.assertIn("0,3% недели", j["changes"][0])
+        self.assertEqual(runner.usage["week"], 50.3)
+        st = self.api("GET", "/api/state")
+        self.assertEqual(st["runners"]["claude"]["week"], 50.0, "расход недели исполнитель передаёт с опросом")
+        out = self.cli_out("show", key)
+        for part in ("Сессии ИИ (новое сверху):", " готово · ", "поручение: [done] добавь поле", "0.3% недели"):
+            self.assertIn(part, out)
+
+    def cli_out(self, *argv):
+        env = dict(os.environ, PULT_URL=self.url, PULT_TOKEN=self.tok["claude"],
+                   PULT_CONFIG=os.path.join(self.tmp, "no.json"))
+        return subprocess.run([sys.executable, "-X", "utf8", os.path.join(ROOT, "pult.py"), *argv],
+                              capture_output=True, text=True, encoding="utf-8", env=env).stdout
+
+    def test_r2_telegram_question_reply(self):
+        link = self.api("POST", "/api/actor/artem/telegram", {}, who="artem")
+        self.assertTrue(link["link"].startswith("https://t.me/test_pult_bot?start="))
+        with self.assertRaises(cli.PultError) as ctx:
+            self.api("POST", "/api/actor/artem/telegram", {}, who="claude")
+        self.assertEqual(ctx.exception.status, 403, "модель Telegram себе не привязывает")
+        code = link["link"].split("start=")[1]
+        FakeBotApi.push({"chat": {"id": 777, "type": "private"}, "from": {"username": "artem_tg"},
+                         "text": "/start " + code})
+        self.sent("Готово, Артём")
+        people = self.api("GET", "/api/people", who="artem")["people"]
+        self.assertEqual(next(p for p in people if p["id"] == "artem")["telegram"]["user"], "artem_tg")
+        FakeBotApi.push({"chat": {"id": 777, "type": "private"}, "text": "/start " + code})
+        self.sent("Ссылка устарела")
+        key = self.keys[1]
+        self.go(key, "[question] выбери цвет")
+        runner = self.runner()
+        asked = self.drive(runner, (key, ("asked",)))
+        self.assertEqual(asked["question"], "Какого цвета кнопка?")
+        msg = self.sent("Какого цвета кнопка?")
+        self.assertEqual(msg["chat"], "777")
+        self.assertIn(f"https://pult.test/#t={key}", msg["text"])
+        self.assertIn("Ответьте на это сообщение", msg["text"])
+        FakeBotApi.push({"chat": {"id": 777, "type": "private"}, "text": "просто текст"})
+        self.sent("ответьте на её сообщение")
+        FakeBotApi.push({"chat": {"id": 777, "type": "private"}, "text": "синий [done]",
+                         "reply_to_message": {"message_id": msg["id"]}})
+        self.sent(f"Передал в работу: {key}")
+        runs = self.api("GET", f"/api/task/{key}")["runs"]
+        self.assertEqual((runs[0]["status"], runs[0]["resume_of"], runs[0]["session"]),
+                         ("queued", asked["id"], asked["session"]))
+        self.assertEqual(self.api("GET", f"/api/task/{key}")["journal"][0]["via"], "telegram")
+        done = self.drive(runner, (key, ("done",)))
+        argv = [c for c in self.calls() if "--bg" in c["argv"]][-1]["argv"]
+        self.assertEqual(argv[argv.index("--resume") + 1], asked["session"])
+        self.assertTrue(argv[-1].startswith("Ответ от Артём:\n\nсиний [done]"))
+        self.assertEqual(done["session"], asked["session"])
+        self.sent("готово")
+        FakeBotApi.push({"chat": {"id": 555, "type": "private"}, "text": "кто здесь",
+                         "reply_to_message": {"message_id": msg["id"]}})
+        self.sent("Этот чат не привязан")
+
+    def test_r3_limits_and_stop(self):
+        key = self.keys[2]
+        self.go(key, "[slow] долгая работа", budget=1)
+        runner = self.runner()
+        st = self.drive(runner, (key, ("stopped",)))
+        self.assertIn("исчерпан бюджет", st["reason"])
+        self.assertGreaterEqual(st["spent"], 1)
+        self.go(key, "[slow] ещё", budget=90)
+        runner.tick()
+        self.assertEqual(self.run_of(key)["status"], "working")
+        self.assertIn("Сессии ИИ (1) — их ведёт исполнитель", self.cli_out("brief"))
+        with self.assertRaises(cli.PultError) as ctx:
+            self.go(key, "[done] вторая сразу")
+        self.assertEqual(ctx.exception.status, 409, "одна сессия на карточку")
+        self.api("POST", f"/api/run/{self.run_of(key)['id']}/stop", {}, who="artem")
+        self.assertTrue(self.run_of(key)["stop_requested"])
+        st = self.drive(runner, (key, ("stopped",)))
+        self.assertEqual(st["reason"], "остановлена по просьбе человека")
+        self.go(key, "[done] до запуска")
+        r = self.api("POST", f"/api/run/{self.run_of(key)['id']}/stop", {}, who="artem")
+        self.assertEqual(r["run"]["status"], "cancelled", "заявку в очереди отменяют сразу")
+        self.api("PATCH", "/api/settings", {"ceiling": 50}, who="artem")
+        try:
+            self.go(key, "[done] выше потолка")
+            st = self.drive(runner, (key, ("failed",)))
+            self.assertIn("выше потолка 50%", st["reason"])
+        finally:
+            self.api("PATCH", "/api/settings", {"ceiling": 80}, who="artem")
+
+    def test_r4_blocked_noauto_and_rules(self):
+        key = self.keys[3]
+        self.go(key, "[stuck] сделай")
+        runner = self.runner()
+        st = self.drive(runner, (key, ("failed",)))
+        self.assertIn("ждёт подтверждения при старте", st["reason"])
+        self.go(key, "[noauto] сделай")
+        runner = self.runner()
+        st = self.drive(runner, (key, ("failed",)))
+        self.assertIn("нет режима auto", st["reason"])
+        self.go(key, "[block] сделай")
+        st = self.drive(runner, (key, ("blocked",)))
+        self.assertEqual(st["question"], "ждёт: permission prompt")
+        with self.assertRaises(cli.PultError) as ctx:
+            self.api("POST", f"/api/run/{st['id']}/reply", {"message": "да"}, who="artem")
+        self.assertEqual(ctx.exception.status, 409)
+        self.api("POST", f"/api/run/{st['id']}/stop", {}, who="artem")
+        self.drive(runner, (key, ("stopped",)))
+        for who, path, body, code in (
+                ("claude", f"/api/task/{key}/run", {"executor": "claude", "message": "сам себе"}, 403),
+                ("artem", f"/api/task/{key}/run", {"executor": "artem", "message": "человеку"}, 400),
+                ("artem", f"/api/task/{key}/run", {"executor": "claude", "message": ""}, 400),
+                ("artem", "/api/runner/poll", {}, 403),
+                ("claude", "/api/run/999999/report", {"status": "done"}, 404),
+                ("artem", f"/api/run/{st['id']}/report", {"status": "done"}, 403)):
+            with self.assertRaises(cli.PultError, msg=(who, path)) as ctx:
+                self.api("POST", path, body, who=who)
+            self.assertEqual(ctx.exception.status, code, (who, path, str(ctx.exception)))
+        self.api("POST", "/api/actor", {"id": "codex", "name": "Codex", "kind": "model", "owner": "guest"}, who="artem")
+        with self.assertRaises(cli.PultError) as ctx:
+            self.go(key, "чужой модели", executor="codex")
+        self.assertEqual(ctx.exception.status, 403)
+        self.assertIn("только её хозяин", str(ctx.exception))
+
+    def test_r5_restart_adopts_session(self):
+        key = self.keys[4]
+        self.go(key, "[slow] долго", budget=90)
+        first = self.runner()
+        first.tick()
+        self.assertEqual(self.run_of(key)["status"], "working")
+        second = self.runner()  # исполнитель перезапустили: сессия ещё идёт
+        second.tick(hello=True)
+        self.assertIsNotNone(second.active)
+        self.assertEqual(second.active["run"]["id"], self.run_of(key)["id"])
+        self.api("POST", f"/api/run/{self.run_of(key)['id']}/stop", {}, who="artem")
+        self.drive(second, (key, ("stopped",)))
+        key2 = self.keys[5]
+        self.go(key2, "[slow] пропадёт", budget=90)
+        third = self.runner()
+        third.tick()
+        os.remove(os.path.join(self.fake, third.active["bg"] + ".json"))  # процесс сессии пропал
+        fourth = self.runner()
+        fourth.tick(hello=True)
+        st = self.run_of(key2)
+        self.assertEqual((st["status"], st["reason"]), ("failed", "исполнитель перезапускался, сессии уже нет"))
+
+    def test_r7_trust_rule(self):
+        """Доверие claude: вне git — от любой папки выше, внутри git-репо — только до его корня."""
+        base = os.path.join(self.tmp, "trust")
+        repo, plain = os.path.join(base, "repo"), os.path.join(base, "plain", "deep")
+        os.makedirs(os.path.join(repo, ".git"))
+        os.makedirs(os.path.join(repo, "sub"))
+        os.makedirs(plain)
+        cj = os.path.join(self.tmp, "claude.json")
+
+        def trust(*paths):
+            with open(cj, "w", encoding="utf-8") as f:
+                json.dump({"projects": {p.replace("\\", "/"): {"hasTrustDialogAccepted": True} for p in paths}}, f)
+
+        t = self.runner_mod.trusted
+        trust(base)
+        self.assertTrue(t(plain, cj), "вне git доверие идёт от папки выше")
+        self.assertFalse(t(os.path.join(repo, "sub"), cj), "в git-репо — только до его корня")
+        trust(base, repo)
+        self.assertTrue(t(os.path.join(repo, "sub"), cj))
+        trust(base.upper())
+        self.assertTrue(t(plain, cj), "регистр букв в пути не важен")
+        self.assertEqual(os.path.normcase(self.runner_mod.git_root(os.path.join(repo, "sub"))), os.path.normcase(repo))
+
+    def test_r6_statusline_and_question_parsing(self):
+        q = self.runner_mod.question_of
+        self.assertEqual(q("Готово.\n**ВОПРОС:** какой цвет?"), "какой цвет?")
+        self.assertEqual(q("ВОПРОС: где файл?\nподсказка ниже"), "где файл?\nподсказка ниже")
+        self.assertEqual(q("Сделано, вопросов нет."), "")
+        path = os.path.join(self.tmp, "status.json")
+        proc = subprocess.run([sys.executable, "-X", "utf8", os.path.join(ROOT, "pult_runner.py"), "statusline", path],
+                              input=json.dumps({"session_name": "W-1", "rate_limits": {"seven_day": {
+                                  "used_percentage": 12.5}}}).encode(), capture_output=True)
+        self.assertEqual(proc.stdout.decode("utf-8").strip(), "Пульт · W-1 · неделя 12.5%")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["rate_limits"]["seven_day"]["used_percentage"], 12.5)
+
+
 class Tls(Base):
     tls = True
 

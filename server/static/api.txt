@@ -15,7 +15,9 @@ https://github.com/ArtYudin89/pult — pult.py, docs/for-ai.md.
                                      к проектам: view (читаю) или edit (правлю); writers у проекта —
                                      кто может его править и держать его задачи; files у задачи —
                                      число вложений; limits.file — предел одного вложения в байтах;
-                                     ai — модель и усилие ИИ для всего Пульта
+                                     ai — модель, усилие ИИ и пределы запуска для всего Пульта;
+                                     run у задачи — её последняя сессия ИИ {id, status}; runners —
+                                     исполнители моих моделей: online, seen, week (% недели), week_resets
   GET   /api/task/<номер>            карточка: описание, журнал, files — список вложений
                                      [{id, name, size, image, created_at, created_by}, …];
                                      task.ai — с какой моделью и усилием запускать сессию по карточке
@@ -37,7 +39,9 @@ https://github.com/ArtYudin89/pult — pult.py, docs/for-ai.md.
   DELETE /api/file/<id>              удалить вложение
 
 Настройки, разделы и проекты (только владелец Пульта)
-  PATCH /api/settings                {model?, effort?} — модель и усилие ИИ для всего Пульта
+  PATCH /api/settings                {model?, effort?, budget?, minutes?, ceiling?} — модель и усилие ИИ
+                                     для всего Пульта; пределы запуска по умолчанию (бюджет в % недели,
+                                     минуты) и потолок недели для исполнителя
   POST  /api/area                    {id, name, prefix, closed?, sort?, model?, effort?} — prefix:
                                      заглавная латиница и цифры, до 6 знаков; номера задач раздела —
                                      PREFIX-1, PREFIX-2, …
@@ -66,3 +70,26 @@ holder — id участника или null; prompt — сообщение дл
 Ответы с ошибкой — {"error": "…"}: 400 неверные данные, 401 ключ не подходит, 403 нет права,
 404 нет такой задачи или к ней нет доступа, 409 конфликт версий, 413 файл больше предела,
 429 много неудачных входов (пауза 10 минут), 507 место для вложений кончилось.
+
+Сессии ИИ по карточкам («Выполнить»)
+  POST  /api/task/<номер>/run        {executor, message, model?, effort?, notes?, budget?, minutes?, version?}
+                                     — только человек и только свою модель (executor — её id): карточку
+                                     держит модель, статус «В работе», заявка ждёт исполнителя; ответ 201
+                                     {task, run}. GET /api/task/<номер> отдаёт runs — сессии карточки
+  POST  /api/run/<id>/stop           остановить идущую сессию или отменить заявку в очереди
+  POST  /api/run/<id>/reply          {message, budget?, minutes?} — продолжить ту же сессию ответом
+  Состояния: queued, started, working, blocked (ждёт разрешения на том компьютере), asked (закончила
+  ход вопросом человеку), done, failed, stopped, cancelled.
+
+Исполнитель (ключ модели; готовый — pult_runner.py)
+  POST  /api/runner/poll             {host, version, busy, wait?, hello?, week?, five?, week_resets?,
+                                     five_resets?, usage_at?} → {run, stop, mine}: ждёт до wait секунд
+                                     (не больше 25) заявку своей модели; stop — какие сессии остановить;
+                                     hello — первый опрос после запуска: mine — его незавершённые сессии
+  POST  /api/run/<id>/report         {status?, session?, bg?, folder?, week_start?, week_now?, question?,
+                                     result?, reason?} — состояние сессии; ответ {ok, status, stop}
+
+Telegram
+  POST  /api/actor/<свой id>/telegram    одноразовая ссылка на бота Пульта: {link, bot, hours}; после Start
+                                     в боте вести о сессиях приходят в этот чат
+  DELETE /api/actor/<id>/telegram    отвязать (себя; владелец — любого)
