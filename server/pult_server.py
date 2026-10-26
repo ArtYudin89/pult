@@ -68,12 +68,14 @@ TRANSLIT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъы�
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 PREFIX_RE = re.compile(r"^[A-Z0-9]{1,6}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,40}$")
+# Модель и усилие для сессии ИИ — как их понимает программа агента: claude-opus-5-5, high, gpt-5-codex…
+AI_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,59}$")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 COOKIE = "pult_s"
 SESSION_TOUCH_SEC = 600
 SESSION_TTL_DAYS = 180
 INVITE_DAYS = 7
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 FILE_MAX = 25 << 20          # одно вложение
 FILES_QUOTA = 500 << 20      # все вложения вместе; меняется ключом --files-quota-mb
 FILES_MIN_FREE = 300 << 20   # столько должно остаться на диске после загрузки
@@ -90,7 +92,7 @@ MONTH_RU = ("января", "февраля", "марта", "апреля", "м�
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
-INSERT OR IGNORE INTO meta(k, v) VALUES ('schema', '3'), ('rev', '0');
+INSERT OR IGNORE INTO meta(k, v) VALUES ('schema', '4'), ('rev', '0');
 CREATE TABLE IF NOT EXISTS actors(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, color TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '', sort INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
@@ -111,18 +113,21 @@ CREATE TABLE IF NOT EXISTS invites(
   used_at TEXT, key_hash TEXT, revoked_at TEXT);
 CREATE TABLE IF NOT EXISTS areas(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, prefix TEXT NOT NULL UNIQUE, closed INTEGER NOT NULL DEFAULT 0,
-  sort INTEGER NOT NULL DEFAULT 0, next_num INTEGER NOT NULL DEFAULT 1);
+  sort INTEGER NOT NULL DEFAULT 0, next_num INTEGER NOT NULL DEFAULT 1,
+  ai_model TEXT NOT NULL DEFAULT '', ai_effort TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS projects(
   id TEXT PRIMARY KEY, area_id TEXT NOT NULL REFERENCES areas(id), name TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '', mem TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '',
   closed INTEGER NOT NULL DEFAULT 0, shared TEXT NOT NULL DEFAULT '', paused TEXT,
-  archived INTEGER NOT NULL DEFAULT 0, sort INTEGER NOT NULL DEFAULT 0);
+  archived INTEGER NOT NULL DEFAULT 0, sort INTEGER NOT NULL DEFAULT 0,
+  ai_model TEXT NOT NULL DEFAULT '', ai_effort TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS tasks(
   id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, project_id TEXT NOT NULL REFERENCES projects(id),
   title TEXT NOT NULL, status TEXT NOT NULL, holder TEXT REFERENCES actors(id),
   next_step TEXT NOT NULL DEFAULT '', wait_for TEXT NOT NULL DEFAULT '',
   check_on TEXT, due_on TEXT, done_on TEXT, notes TEXT NOT NULL DEFAULT '',
-  mem TEXT NOT NULL DEFAULT '', checklist TEXT NOT NULL DEFAULT '[]',
+  mem TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL DEFAULT '',
+  ai_model TEXT NOT NULL DEFAULT '', ai_effort TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL,
   version INTEGER NOT NULL DEFAULT 1);
 CREATE INDEX IF NOT EXISTS tasks_project ON tasks(project_id);
@@ -153,16 +158,21 @@ TASK_FIELDS = {
     "done_on": ("done_on", "date", "Закрыта"),
     "notes": ("notes", "notes", "Описание"),
     "mem": ("mem", "text", "Подробности"),
-    "checklist": ("checklist", "checklist", "Шаги"),
+    "prompt": ("prompt", "prompt", "Сообщение для ИИ"),
+    "model": ("ai_model", "ai", "Модель ИИ"),
+    "effort": ("ai_effort", "ai", "Усилие ИИ"),
 }
 PROJECT_FIELDS = {
     "area": ("area_id", "area"), "name": ("name", "title"), "note": ("note", "text"),
     "mem": ("mem", "text"), "path": ("path", "text"), "closed": ("closed", "bool"),
     "shared": ("shared", "text"), "paused": ("paused", "date"), "archived": ("archived", "bool"),
-    "sort": ("sort", "int"),
+    "sort": ("sort", "int"), "model": ("ai_model", "ai"), "effort": ("ai_effort", "ai"),
 }
 AREA_FIELDS = {"name": ("name", "title"), "prefix": ("prefix", "prefix"), "closed": ("closed", "bool"),
-               "sort": ("sort", "int")}
+               "sort": ("sort", "int"), "model": ("ai_model", "ai"), "effort": ("ai_effort", "ai")}
+AI_FIELDS = {"model": "Модель ИИ", "effort": "Усилие ИИ"}
+# Откуда взяты модель и усилие: нижний уровень переопределяет верхний.
+AI_LEVELS = ("task", "project", "area", "pult")
 ACTOR_FIELDS = {"name": ("name", "title"), "kind": ("kind", "kind"), "color": ("color", "text"),
                 "note": ("note", "text"), "sort": ("sort", "int"), "active": ("active", "bool"),
                 "role": ("role", "role"), "owner": ("owner_id", "owner")}
@@ -305,19 +315,12 @@ def v_date(value, field):
         raise ApiError(400, f"{field}: дата в виде ГГГГ-ММ-ДД") from None
 
 
-def v_checklist(value):
-    if value is None:
-        return []
-    if not isinstance(value, list) or len(value) > 100:
-        raise ApiError(400, "шаги: нужен список до 100 пунктов")
-    out = []
-    for item in value:
-        if isinstance(item, str):
-            item = {"t": item, "on": False}
-        if not isinstance(item, dict):
-            raise ApiError(400, "шаги: каждый пункт — {t, on}")
-        out.append({"t": v_text(item.get("t"), "шаг", 300, required=True), "on": bool(item.get("on"))})
-    return out
+def v_ai(value, field):
+    """Модель или усилие ИИ; пусто — взять с уровня выше."""
+    value = v_text(value, field, 60)
+    if value and not AI_RE.match(value):
+        raise ApiError(400, f"{field}: латиница, цифры и . _ : / @ + -, без пробелов")
+    return value
 
 
 def v_int(value, field):
@@ -332,24 +335,18 @@ def v_id(value, field):
     return value
 
 
-# ---------- журнал: человеческие описания изменений ----------
+def prompt_change(value):
+    # Сообщение для ИИ — поручение человека: в журнал целиком, чтобы после очистки поля осталось, что просили.
+    return f"Сообщение для ИИ: «{value}»" if value else "Сообщение для ИИ: убрано"
 
-def checklist_changes(old, new):
-    out, pool = [], {}
-    for item in old:
-        pool.setdefault(item["t"], []).append(item["on"])
-    for item in new:
-        if pool.get(item["t"]):
-            was = pool[item["t"]].pop(0)
-            if was != item["on"]:
-                out.append(f"Шаг «{short(item['t'], 70)}» — {'выполнен' if item['on'] else 'снова открыт'}")
-        else:
-            out.append(f"Добавлен шаг «{short(item['t'], 70)}»" + (" (выполнен)" if item["on"] else ""))
-    for text, rest in pool.items():
-        out.extend(f"Убран шаг «{short(text, 70)}»" for _ in rest)
-    if not out and [i["t"] for i in old] != [i["t"] for i in new]:
-        out.append("Шаги переставлены")
-    return out
+
+def ai_change(label, value):
+    return f"{label}: {value}" if value else f"{label}: как у проекта"
+
+
+def steps_text(items):
+    """Пункты убранного поля «Шаги» строками для описания: отмеченные — с галочкой."""
+    return "\n".join(("☑ " if i.get("on") else "☐ ") + str(i.get("t", "")).strip() for i in items)
 
 
 class DB:
@@ -380,6 +377,25 @@ class DB:
                 c.execute("UPDATE actors SET role = 'owner' WHERE id IN "
                           "(SELECT actor_id FROM keys WHERE revoked_at IS NULL)")
             # Этап 3 добавил только таблицу вложений: её заводит SCHEMA, переносить нечего.
+            if ver < 4:
+                for table, cols in (("areas", ("ai_model", "ai_effort")), ("projects", ("ai_model", "ai_effort")),
+                                    ("tasks", ("prompt", "ai_model", "ai_effort"))):
+                    have = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+                    for col in cols:
+                        if col not in have:
+                            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+                # Поля «Шаги» больше нет: пункты дописываются в конец описания. Столбец остаётся пустым,
+                # чтобы с этой базой работала и прежняя версия сервера, если придётся откатиться.
+                if "checklist" in {r["name"] for r in c.execute("PRAGMA table_info(tasks)")}:
+                    rows = c.execute("SELECT id, notes, checklist FROM tasks "
+                                     "WHERE checklist NOT IN ('', '[]')").fetchall()
+                    for r in rows:
+                        notes = (r["notes"] + "\n\n" if r["notes"] else "") + \
+                            "Шаги (раньше были отдельным полем):\n" + steps_text(json.loads(r["checklist"]))
+                        c.execute("UPDATE tasks SET notes = ?, checklist = '[]', version = version + 1 WHERE id = ?",
+                                  (notes, r["id"]))
+                    if rows:
+                        self.bump(c)
             c.execute("UPDATE meta SET v = ? WHERE k = 'schema'", (str(SCHEMA_VERSION),))
 
     @contextlib.contextmanager
@@ -552,18 +568,39 @@ class DB:
     def task_dict(r, full=False, files=0):
         d = {"key": r["key"], "project": r["project_id"], "title": r["title"], "status": r["status"],
              "holder": r["holder"], "next": r["next_step"], "wait": r["wait_for"], "check": r["check_on"],
-             "due": r["due_on"], "done_on": r["done_on"], "mem": r["mem"],
-             "checklist": json.loads(r["checklist"]), "created_at": r["created_at"],
+             "due": r["due_on"], "done_on": r["done_on"], "mem": r["mem"], "prompt": r["prompt"],
+             "model": r["ai_model"], "effort": r["ai_effort"], "created_at": r["created_at"],
              "created_by": r["created_by"], "updated_at": r["updated_at"], "updated_by": r["updated_by"],
              "version": r["version"], "has_notes": bool(r["notes"]), "files": files}
         if full:
             d["notes"] = r["notes"]
         return d
 
+    @staticmethod
+    def ai_settings(c):
+        """Модель и усилие по умолчанию для всего Пульта — строка meta 'ai'."""
+        r = c.execute("SELECT v FROM meta WHERE k = 'ai'").fetchone()
+        v = json.loads(r["v"]) if r else {}
+        return {"model": v.get("model", ""), "effort": v.get("effort", "")}
+
+    def ai_for(self, c, r):
+        """С какой моделью и усилием запускать сессию по карточке и с какого уровня они взяты."""
+        p = c.execute("SELECT p.ai_model AS pm, p.ai_effort AS pe, a.ai_model AS am, a.ai_effort AS ae "
+                      "FROM projects p JOIN areas a ON a.id = p.area_id WHERE p.id = ?", (r["project_id"],)).fetchone()
+        pult = self.ai_settings(c)
+        chain = {"model": [r["ai_model"], p["pm"] if p else "", p["am"] if p else "", pult["model"]],
+                 "effort": [r["ai_effort"], p["pe"] if p else "", p["ae"] if p else "", pult["effort"]]}
+        out = {}
+        for name, values in chain.items():
+            level = next((i for i, v in enumerate(values) if v), None)
+            out[name] = values[level] if level is not None else ""
+            out[name + "_from"] = AI_LEVELS[level] if level is not None else ""
+        return out
+
     def task_out(self, c, r):
-        """Карточка для ответа на правку: с описанием и числом вложений."""
+        """Карточка для ответа на правку: с описанием, числом вложений и моделью для сессии."""
         n = c.execute("SELECT COUNT(*) FROM files WHERE task_id = ? AND deleted_at IS NULL", (r["id"],)).fetchone()[0]
-        return self.task_dict(r, full=True, files=n)
+        return dict(self.task_dict(r, full=True, files=n), ai=self.ai_for(c, r))
 
     @staticmethod
     def file_dict(r):
@@ -589,12 +626,14 @@ class DB:
             projects = [{"id": r["id"], "area": r["area_id"], "name": r["name"], "note": r["note"],
                          "mem": r["mem"], "path": r["path"], "closed": bool(r["closed"]), "shared": r["shared"],
                          "paused": r["paused"], "archived": bool(r["archived"]), "sort": r["sort"],
+                         "model": r["ai_model"], "effort": r["ai_effort"],
                          "writers": [a for a, m in every.items() if m.get(r["id"]) == 2]}
                         for r in c.execute("SELECT * FROM projects ORDER BY sort, name") if r["id"] in acc]
             shown = {p["area"] for p in projects}
             areas = [{"id": r["id"], "name": r["name"], "prefix": r["prefix"], "closed": bool(r["closed"]),
-                      "sort": r["sort"]} for r in c.execute("SELECT * FROM areas ORDER BY sort, name")
-                     if owner or r["id"] in shown]
+                      "sort": r["sort"], "model": r["ai_model"], "effort": r["ai_effort"]}
+                     for r in c.execute("SELECT * FROM areas ORDER BY sort, name") if owner or r["id"] in shown]
+            ai = self.ai_settings(c)
             nfiles = dict(c.execute("SELECT task_id, COUNT(*) FROM files WHERE deleted_at IS NULL GROUP BY task_id"))
             tasks = [self.task_dict(r, files=nfiles.get(r["id"], 0))
                      for r in c.execute("SELECT * FROM tasks ORDER BY id") if r["project_id"] in acc]
@@ -609,7 +648,7 @@ class DB:
             actors = [self.actor_dict(r) for r in rows]
         return {"rev": rev, "today": dt.date.today().isoformat(), "me": public_actor(me), "owner": owner,
                 "access": {p: LEVELS[n - 1] for p, n in acc.items()}, "actors": actors,
-                "areas": areas, "projects": projects, "tasks": tasks}
+                "areas": areas, "projects": projects, "tasks": tasks, "ai": ai}
 
     def task_row(self, c, key):
         r = c.execute("SELECT * FROM tasks WHERE key = ?", (norm_key(key),)).fetchone()
@@ -626,8 +665,9 @@ class DB:
                                   (r["id"], journal_limit)).fetchall()
             files = [self.file_dict(f) for f in self.conn.execute(
                 "SELECT * FROM files WHERE task_id = ? AND deleted_at IS NULL ORDER BY id", (r["id"],))]
-        return {"task": self.task_dict(r, full=True, files=len(files)), "journal": [self.journal_dict(x) for x in j],
-                "files": files}
+            ai = self.ai_for(self.conn, r)
+        return {"task": dict(self.task_dict(r, full=True, files=len(files)), ai=ai),
+                "journal": [self.journal_dict(x) for x in j], "files": files}
 
     def journal(self, actor, limit=100, before=None, who=None, project=None, since=None, task=None):
         sql, args = ["SELECT * FROM journal WHERE 1 = 1"], []
@@ -671,6 +711,8 @@ class DB:
         return r["name"] if r else pid
 
     def _clean_task(self, c, body, creating):
+        if "checklist" in body:
+            raise ApiError(400, "поля «Шаги» больше нет: план пишите в описание (notes)")
         out = {}
         for name, (col, kind, label) in TASK_FIELDS.items():
             if name not in body:
@@ -695,10 +737,12 @@ class DB:
                 value = v_text(value, label, 500)
             elif kind == "notes":
                 value = v_text(value, label, 20_000)
+            elif kind == "prompt":
+                value = v_text(value, label, 4000)
             elif kind == "date":
                 value = v_date(value, label)
-            elif kind == "checklist":
-                value = v_checklist(value)
+            elif kind == "ai":
+                value = v_ai(value, label)
             out[col] = value
         if creating:
             if "project_id" not in out or "title" not in out:
@@ -748,8 +792,8 @@ class DB:
         cols = {"key": key, "project_id": f["project_id"], "title": f["title"], "status": f["status"],
                 "holder": f.get("holder"), "next_step": f.get("next_step", ""), "wait_for": f.get("wait_for", ""),
                 "check_on": f.get("check_on"), "due_on": f.get("due_on"), "done_on": f.get("done_on"),
-                "notes": f.get("notes", ""), "mem": f.get("mem", ""),
-                "checklist": json.dumps(f.get("checklist", []), ensure_ascii=False),
+                "notes": f.get("notes", ""), "mem": f.get("mem", ""), "prompt": f.get("prompt", ""),
+                "ai_model": f.get("ai_model", ""), "ai_effort": f.get("ai_effort", ""),
                 "created_at": created_at, "created_by": actor["id"], "updated_at": stamp,
                 "updated_by": actor["id"], "version": 1}
         c.execute(f"INSERT INTO tasks({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
@@ -758,6 +802,12 @@ class DB:
         changes = [f"Статус: {STATUS_RU[f['status']]}"]
         if f.get("holder"):
             changes.append(f"Держит: {self._actor_name(c, f['holder'])}")
+        if f.get("prompt"):
+            changes.append(prompt_change(f["prompt"]))
+        for name in ("model", "effort"):
+            col, _, label = TASK_FIELDS[name]
+            if f.get(col):
+                changes.append(ai_change(label, f[col]))
         self._journal(c, actor, via, "create", task=row, text=comment, changes=changes,
                       at=created_at if imported else stamp, extra={"source": source} if source else None)
         for e in (body.get("journal") or []) if imported else ():
@@ -799,7 +849,7 @@ class DB:
         clash = linked(touched) & linked(fields)
         if not clash:
             return
-        names = [TASK_FIELDS[f][2].lower() for f in TASK_FIELDS if f in clash and not (
+        names = [TASK_FIELDS[f][2][0].lower() + TASK_FIELDS[f][2][1:] for f in TASK_FIELDS if f in clash and not (
             f == "done_on" and "status" in clash)]
         if "files" in clash:
             names.append("вложения")
@@ -828,11 +878,10 @@ class DB:
             for name, (col, kind, label) in TASK_FIELDS.items():
                 if col not in new:
                     continue
-                old = json.loads(row[col]) if kind == "checklist" else row[col]
-                value = new[col]
-                if old == value or (kind in ("text", "notes") and (old or "") == (value or "")):
+                old, value = row[col], new[col]
+                if old == value or (kind in ("text", "notes", "prompt", "ai") and (old or "") == (value or "")):
                     continue
-                sets[col] = json.dumps(value, ensure_ascii=False) if kind == "checklist" else value
+                sets[col] = value
                 fields.add(name)
                 if kind == "status":
                     changes.append(f"Статус: {STATUS_RU[old]} → {STATUS_RU[value]}")
@@ -851,8 +900,10 @@ class DB:
                 elif kind == "notes":
                     changes.append("Описание добавлено" if not old else "Описание убрано" if not value
                                    else "Описание изменено")
-                elif kind == "checklist":
-                    changes.extend(checklist_changes(old, value))
+                elif kind == "prompt":
+                    changes.append(prompt_change(value))
+                elif kind == "ai":
+                    changes.append(ai_change(label, value))
             if not sets and not comment:
                 return {"task": self.task_out(c, row), "unchanged": True}
             if sets.keys() & {"holder", "project_id"}:
@@ -1070,6 +1121,8 @@ class DB:
                 value = v_int(value, f"{what}.{name}")
             elif kind == "date":
                 value = v_date(value, f"{what}.{name}")
+            elif kind == "ai":
+                value = v_ai(value, f"{what}.{name}")
             elif kind == "area":
                 if not isinstance(value, str) or not c.execute("SELECT 1 FROM areas WHERE id = ?",
                                                                (value,)).fetchone():
@@ -1140,11 +1193,38 @@ class DB:
                 raise ApiError(404, f"нет: {ident}")
             created = fn(c, body)
             what = {"area": "Раздел", "project": "Проект"}[kind]
+            changes = [f"{what} «{body.get('name') or body['id']}» {'создан' if created else 'изменён'}"]
+            above = "как у раздела" if kind == "project" else "как у Пульта"
+            changes += [f"{label}: {v_ai(body[name], label) or above}" for name, label in AI_FIELDS.items()
+                        if name in body]
             self._journal(c, actor, actor.get("via"), kind, project=body["id"] if kind == "project" else None,
-                          text="", changes=[f"{what} «{body.get('name') or body['id']}» "
-                                            f"{'создан' if created else 'изменён'}"])
+                          text="", changes=changes)
             self.bump(c)
         return {"ok": True, "created": created}
+
+    def save_settings(self, actor, body):
+        """Модель и усилие ИИ для всего Пульта — верхний уровень: раздел, проект и карточка их переопределяют."""
+        extra = set(body) - set(AI_FIELDS)
+        if extra:
+            raise ApiError(400, f"настройки Пульта: только {', '.join(AI_FIELDS)}, а не {', '.join(sorted(extra))}")
+        with self.tx() as c:
+            self.need_owner(c, actor, "менять настройки Пульта")
+            cur = self.ai_settings(c)
+            changes = []
+            for name, label in AI_FIELDS.items():
+                if name not in body:
+                    continue
+                value = v_ai(body[name], label)
+                if value != cur[name]:
+                    cur[name] = value
+                    gone = "убрана" if name == "model" else "убрано"
+                    changes.append(f"{label} для всего Пульта: {value}" if value
+                                   else f"{label} для всего Пульта {gone}")
+            if changes:
+                c.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('ai', ?)", (json.dumps(cur),))
+                self._journal(c, actor, actor.get("via"), "settings", changes=changes)
+                self.bump(c)
+        return {"ai": cur}
 
     def import_bundle(self, actor, body):
         if not isinstance(body.get("tasks", []), list):
@@ -1820,6 +1900,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ApiError(400, "limit и before — числа") from None
         if method == "GET" and parts == ["people"]:
             return self.send_json(200, db.people(actor))
+        if method == "PATCH" and parts == ["settings"]:
+            return self.send_json(200, db.save_settings(actor, self.read_json()))
         if head == "task":
             if method == "POST" and len(parts) == 1:
                 return self.send_json(201, {"task": db.create_task(actor, self.read_json())})
@@ -2223,8 +2305,10 @@ def init_cmd(args):
         "project": "pult", "title": "Подключить ИИ к Пульту", "status": "next", "holder": aid or pid,
         "next": "вписать в инструкции ИИ блок из docs/for-ai.md",
         "notes": "ИИ читает сводку в начале сессии (pult.py brief) и сам двигает карточки в конце (pult.py apply). "
-                 "Эта карточка — первая: закройте её, когда ИИ впервые подвинет карточки сам.",
-        "checklist": WELCOME_STEPS, "comment": "Пульт создан"})
+                 "Эта карточка — первая: закройте её, когда ИИ впервые подвинет карточки сам.\n\nПо шагам:\n" +
+                 "\n".join(f"{i}. {s}" for i, s in enumerate(WELCOME_STEPS, 1)),
+        "prompt": "Заведи в Пульте мои проекты и задачи: спроси, над чем я сейчас работаю, и разложи по проектам.",
+        "comment": "Пульт создан"})
     invite = db.create_invite(me, pid, {"days": 7, "note": "первый вход"})
     login = os.path.join(out, f"login-{pid}.txt")
     write_private(login, url + "/login#i=" + invite["token"] + "\n")

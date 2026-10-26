@@ -28,13 +28,20 @@ prod, old_srv, new_srv, static, cli_dir = sys.argv[1:6]
 sys.path.insert(0, cli_dir)
 import pult as cli  # noqa: E402
 
-# этап 3: в /api/state — limits, у задачи — число вложений, у карточки — их список
-NEW_TOP = {"limits"}
+# этап 3: в /api/state — limits, у задачи — число вложений, у карточки — их список.
+# Схема 4: у задачи — сообщение для ИИ, модель и усилие, у карточки — ещё ai (что получилось по уровням),
+# у проекта и раздела — модель и усилие, в /api/state — ai всего Пульта. Поля «Шаги» нет: при переходе его
+# пункты дописаны в конец описания, версия карточки и rev выросли на 1 — as_after_move() делает то же
+# со старым ответом, а остальное должно совпасть.
+NEW_TOP = {"limits", "ai"}
 NEW_ACTOR = set()
-NEW_PROJECT = set()
+NEW_AREA = {"model", "effort"}
+NEW_PROJECT = {"model", "effort"}
 NEW_JOURNAL = set()
-NEW_TASK = {"files"}
+NEW_TASK = {"files", "prompt", "model", "effort"}
 NEW_CARD = {"files"}
+NEW_CARD_TASK = {"ai"}
+GONE_TASK = {"checklist"}
 
 
 def pick_actor(db_path, prefer):
@@ -74,15 +81,33 @@ def strip(obj, kind):
         obj = {k: v for k, v in obj.items() if k not in NEW_TOP}
         obj["me"] = {k: v for k, v in obj["me"].items() if k not in NEW_ACTOR}
         obj["actors"] = [{k: v for k, v in a.items() if k not in NEW_ACTOR} for a in obj["actors"]]
+        obj["areas"] = [{k: v for k, v in a.items() if k not in NEW_AREA} for a in obj["areas"]]
         obj["projects"] = [{k: v for k, v in p.items() if k not in NEW_PROJECT} for p in obj["projects"]]
-        obj["tasks"] = [{k: v for k, v in t.items() if k not in NEW_TASK} for t in obj["tasks"]]
+        obj["tasks"] = [{k: v for k, v in t.items() if k not in NEW_TASK | GONE_TASK} for t in obj["tasks"]]
     elif kind == "journal":
         obj = [{k: v for k, v in e.items() if k not in NEW_JOURNAL} for e in obj]
     elif kind == "card":
         obj = {k: v for k, v in obj.items() if k not in NEW_CARD}
-        obj["task"] = {k: v for k, v in obj["task"].items() if k not in NEW_TASK}
+        obj["task"] = {k: v for k, v in obj["task"].items() if k not in NEW_TASK | NEW_CARD_TASK | GONE_TASK}
         obj["journal"] = strip(obj["journal"], "journal")
     return obj
+
+
+def as_after_move(obj, kind):
+    """Старый ответ таким, каким его должен сделать переход на схему 4: «Шаги» — в конце описания, версия +1."""
+    def fix(t, full):
+        items = t.get("checklist") or []
+        if not items:
+            return t
+        t = dict(t, version=t["version"] + 1, has_notes=True)
+        if full:
+            t["notes"] = (t["notes"] + "\n\n" if t["notes"] else "") + "Шаги (раньше были отдельным полем):\n" + \
+                "\n".join(("☑ " if i["on"] else "☐ ") + i["t"].strip() for i in items)
+        return t
+    if kind == "state":
+        moved = any(t.get("checklist") for t in obj["tasks"])
+        return dict(obj, tasks=[fix(t, False) for t in obj["tasks"]], rev=obj["rev"] + moved)
+    return dict(obj, task=fix(obj["task"], True))
 
 
 def cli_out(port, *argv):
@@ -124,7 +149,9 @@ try:
     print("state: roles after migration:", [(a["id"], a["role"], a["owner"]) for a in st["new"]["actors"]])
     print("state: access entries:", len(st["new"]["access"]), "projects:", len(st["new"]["projects"]),
           "writers of eltan:", next(p["writers"] for p in st["new"]["projects"] if p["id"] == "eltan"))
-    a, b = strip(st["old"], "state"), strip(st["new"], "state")
+    moved = [t["key"] for t in st["old"]["tasks"] if t.get("checklist")]
+    print(f"state: cards with steps moved into notes: {len(moved)}")
+    a, b = strip(as_after_move(st["old"], "state"), "state"), strip(st["new"], "state")
     if a != b:
         diffs += 1
         for k in a:
@@ -137,7 +164,7 @@ try:
     for t in st["old"]["tasks"]:
         o = get(ports["old"], f"/api/task/{urllib.request.quote(t['key'])}?journal=1000")
         n = get(ports["new"], f"/api/task/{urllib.request.quote(t['key'])}?journal=1000")
-        if strip(o, "card") != strip(n, "card"):
+        if strip(as_after_move(o, "card"), "card") != strip(n, "card"):
             bad.append(t["key"])
     print(f"cards: {len(st['old']['tasks'])} compared, differ: {bad or 'none'}")
     diffs += bool(bad)

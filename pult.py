@@ -6,10 +6,10 @@
 Подключение:
   pult.py connect АДРЕС [--token-file ФАЙЛ]  адрес Пульта и ключ модели → .local/config.json
 Чтение:
-  pult.py brief [--project P | --area A]   что требует внимания — начало сессии
+  pult.py brief [--project P | --area A]   сообщения для ИИ и что требует внимания — начало сессии
   pult.py ls [--project P] [--area A] [--status S] [--holder H] [--closed | --all]
   pult.py find СЛОВА…                       поиск, как на странице
-  pult.py show КЛЮЧ [--journal N]           карточка с описанием, шагами и журналом
+  pult.py show КЛЮЧ [--journal N]           карточка: описание, сообщение для ИИ, модель, журнал
   pult.py log [--since 2d] [--by ID] [--project P] [--limit N]
   pult.py projects                          разделы и проекты с id
   pult.py url [КЛЮЧ]                        адрес страницы или задачи
@@ -18,7 +18,7 @@
 Запись:
   pult.py apply ФАЙЛ.json                   пакет изменений — так ИИ двигает карточки в конце сессии
   pult.py add --project P --title T [поля]  pult.py set КЛЮЧ [поля]   pult.py done КЛЮЧ [--result R]
-  pult.py note КЛЮЧ ТЕКСТ                   pult.py step КЛЮЧ add ТЕКСТ | check N | uncheck N | remove N
+  pult.py note КЛЮЧ ТЕКСТ                   запись в журнал
   pult.py import ФАЙЛ.json                  перенос: участники, разделы, проекты, задачи
 Вложения:
   pult.py attach КЛЮЧ ФАЙЛ… [-m ТЕКСТ]      прикрепить файлы (до 25 МБ каждый); список — в show
@@ -40,8 +40,8 @@
 
 Одновременная правка. Сессия помечается PULT_SESSION, а в Claude Code — первыми знаками CLAUDE_CODE_SESSION_ID,
 и запоминает в .local/seen/, какими видела карточки: первое чтение Пульта — все задачи, show — открытую
-карточку. set, done, delete и шаг по номеру уходят с этой версией: если с тех пор другие поменяли те же
-поля, сервер не затрёт их правку, а pult.py покажет, что изменилось. Правки других полей сливаются сами.
+карточку. set, done и delete уходят с этой версией: если с тех пор другие поменяли те же поля, сервер
+не затрёт их правку, а pult.py покажет, что изменилось. Правки других полей сливаются сами.
 """
 import argparse
 import datetime as dt
@@ -73,8 +73,11 @@ GROUP_RU = {"late": "Просрочено", "check": "Пора проверит�
             "next": "Следующие", "inbox": "Входящие"}
 FIELD_RU = {"project": "проект", "title": "название", "status": "статус", "holder": "держит",
             "next": "следующий шаг", "wait": "ждём", "check": "проверить", "due": "срок", "done_on": "закрыта",
-            "notes": "описание", "mem": "подробности", "checklist": "шаги", "comment": "запись в журнал"}
-TEXT_FIELDS = ("title", "next", "wait", "notes", "mem")
+            "notes": "описание", "mem": "подробности", "prompt": "сообщение для ИИ", "model": "модель ИИ",
+            "effort": "усилие ИИ", "comment": "запись в журнал"}
+TEXT_FIELDS = ("title", "next", "wait", "notes", "mem", "prompt", "model", "effort")
+AI_FROM = {"task": "в карточке", "project": "из проекта", "area": "из раздела", "pult": "для всего Пульта"}
+NO_STEPS = "поля «Шаги» больше нет: план пишите в описание (notes)"
 DATE_FIELDS = ("check", "due", "done_on")
 FOLD = str.maketrans("авсенкмортхуё", "abcehkmoptxye")
 LOOKALIKE = str.maketrans("АВСЕНКМОРТХУ", "ABCEHKMOPTXY")
@@ -271,9 +274,7 @@ def clean_fields(raw, me_id):
             s = "" if v is None else str(v).strip()
             body[k] = None if s in ("", "-", "никто", "none", "null") else (me_id if s in ("me", "я") else s)
         elif k == "checklist":
-            if not isinstance(v, list):
-                raise ValueError("checklist: нужен список")
-            body[k] = [{"t": i, "on": False} if isinstance(i, str) else i for i in v]
+            raise ValueError(NO_STEPS)
         elif k in TEXT_FIELDS:
             body[k] = "" if v is None or str(v).strip() == "-" else str(v)
         elif k == "project":
@@ -393,7 +394,7 @@ class View:
 
 
 def matches(view, t, words):
-    hay = " ".join([t["key"], t["title"], view.where(t), t["next"] or "", t["wait"] or "",
+    hay = " ".join([t["key"], t["title"], view.where(t), t["next"] or "", t["wait"] or "", t.get("prompt") or "",
                     view.actor(t["holder"]) if t["holder"] else ""]).lower().translate(FOLD)
     return all(w in hay for w in words)
 
@@ -435,6 +436,13 @@ def cmd_brief(cfg, args):
     elif args.area:
         scope = " · " + v.areas[args.area]["name"]
     print(f"Пульт · {ddmm(st['today'])}{scope} · открытых {open_n} · {cfg['url']}")
+    asks = [t for t in v.ordered(tasks) if t.get("prompt") and v.is_open(t)]
+    if asks:
+        print(f"Сообщения для ИИ ({len(asks)}) — поручения людей, начать с них")
+        for t in asks:
+            print("  " + v.line(t, project=not args.project, width=0 if scoped else 160))
+            text = " / ".join(t["prompt"].splitlines())
+            print("           «" + (text if len(text) <= 300 else text[:299] + "…") + "»")
     if not print_groups(v, tasks, limit=None if scoped else 8, project=not args.project, width=0 if scoped else 160):
         print("Открытых задач нет.")
     week = (dt.date.fromisoformat(st["today"]) - dt.timedelta(days=7)).isoformat()
@@ -509,6 +517,11 @@ def cmd_show(cfg, args):
     print(f"  проект:   {v.where(t)} ({t['project']})")
     print(f"  статус:   {STATUS_RU[t['status']]}" + ("  — ПРОСРОЧЕНО" if v.late(t) else ""))
     print(f"  держит:   {v.actor(t['holder']) if t['holder'] else 'никто'}")
+    ai = t.get("ai") or {}
+    bits = [f"{label} {ai[k]} ({AI_FROM.get(ai.get(k + '_from'), '?')})"
+            for k, label in (("model", "модель"), ("effort", "усилие")) if ai.get(k)]
+    if bits:
+        print("  ИИ:       " + " · ".join(bits))
     if t["next"]:
         print(f"  {'итог:    ' if not v.is_open(t) else 'дальше:  '} {t['next']}")
     if t["wait"]:
@@ -522,14 +535,14 @@ def cmd_show(cfg, args):
     print(f"  версия {t['version']}, создана {stamp(t['created_at'])} ({v.actor(t['created_by'])}), "
           f"изменена {stamp(t['updated_at'])} ({v.actor(t['updated_by'])})")
     print(f"  ссылка:   {cfg['url']}/#t={q(t['key'])}")
+    if t.get("prompt"):
+        print("Сообщение для ИИ (взяв в работу, очистить: \"prompt\": \"-\"):")
+        for line in t["prompt"].splitlines():
+            print("  " + line)
     if t["notes"]:
         print("Описание:")
         for line in t["notes"].splitlines():
             print("  " + line)
-    if t["checklist"]:
-        print("Шаги:")
-        for i, c in enumerate(t["checklist"], 1):
-            print(f"  {i}. [{'x' if c['on'] else ' '}] {c['t']}")
     if r.get("files"):
         print("Вложения (скачать — pult.py fetch НОМЕР):")
         for f in r["files"]:
@@ -705,52 +718,6 @@ def with_version(cfg, key, op, body):
     return body
 
 
-def op_step(cfg, key, action, arg):
-    # Шаг по номеру сверяем с версией, какой сессия видела карточку: номера могли сдвинуться.
-    # Шаг по тексту ищется в свежем списке — его сливаем с чужими правками сами.
-    by_number = action != "add" and bool(re.match(r"^\d+$", str(arg)))
-    ver = seen(cfg).version(key) if by_number else None
-    for attempt in (1, 2):
-        t = request(cfg, "GET", f"/api/task/{q(key)}?journal=1")["task"]
-        items = [dict(c) for c in t["checklist"]]
-        if action == "add":
-            items.append({"t": str(arg), "on": False})
-        else:
-            idx = resolve_step(items, arg)
-            if action == "check":
-                items[idx]["on"] = True
-            elif action == "uncheck":
-                items[idx]["on"] = False
-            elif action == "remove":
-                items.pop(idx)
-            else:
-                raise ValueError(f"шаг: add, check, uncheck или remove, а не {action!r}")
-        body = {"checklist": items, "version": t["version"] if ver is None else ver}
-        try:
-            return body, request(cfg, "PATCH", f"/api/task/{q(key)}", body)
-        except PultError as e:
-            if e.status != 409:
-                raise
-            if ver is not None:
-                raise Conflict(conflict_text(cfg, key, e, ver)) from None
-            if attempt == 2:
-                raise
-    raise AssertionError("unreachable")
-
-
-def resolve_step(items, arg):
-    """Шаг по номеру (с 1) или по куску текста — ровно одно совпадение."""
-    if isinstance(arg, int) or re.match(r"^\d+$", str(arg)):
-        i = int(arg) - 1
-        if not 0 <= i < len(items):
-            raise ValueError(f"нет шага {arg}, всего {len(items)}")
-        return i
-    hits = [i for i, c in enumerate(items) if str(arg).lower() in c["t"].lower()]
-    if len(hits) != 1:
-        raise ValueError(f"шаг «{arg}»: совпадений {len(hits)}, нужно ровно одно")
-    return hits[0]
-
-
 def run_op(cfg, op):
     kind = op.get("op")
     if kind == "add":
@@ -784,11 +751,7 @@ def run_op(cfg, op):
         request(cfg, "POST", f"/api/task/{q(key)}/comment", {"text": text})
         return f"{key}: запись в журнал"
     if kind == "step":
-        for action in ("add", "check", "uncheck", "remove"):
-            if action in op:
-                body, resp = op_step(cfg, key, action, op[action])
-                return f"{key}: шаг {action} — " + ("без изменений" if resp.get("unchanged") else "записано")
-        raise ValueError("step: нужен один из add, check, uncheck, remove")
+        raise ValueError(NO_STEPS)
     if kind == "delete":
         ver = with_version(cfg, key, op, {}).get("version")
         try:
@@ -805,7 +768,7 @@ def run_op(cfg, op):
         if op.get("comment"):
             request(cfg, "POST", f"/api/task/{q(key)}/comment", {"text": str(op["comment"])})
         return out
-    raise ValueError(f"неизвестная операция {kind!r}: add, set, done, note, step, attach, delete, project, area")
+    raise ValueError(f"неизвестная операция {kind!r}: add, set, done, note, attach, delete, project, area, settings")
 
 
 def cmd_apply(cfg, args):
@@ -819,6 +782,9 @@ def cmd_apply(cfg, args):
             if op.get("op") in ("project", "area"):
                 kind = op["op"]
                 body = {k: v for k, v in op.items() if k != "op"}
+                for k in ("model", "effort"):
+                    if k in body and (body[k] is None or str(body[k]).strip() == "-"):
+                        body[k] = ""
                 pid = body.pop("id")
                 st = get_state(cfg)
                 exists = any(p["id"] == pid for p in st[kind + "s"])
@@ -827,6 +793,10 @@ def cmd_apply(cfg, args):
                 else:
                     request(cfg, "POST", f"/api/{kind}", dict(body, id=pid))
                 print(f"{i}. {'проект' if kind == 'project' else 'раздел'} {pid}: {'изменён' if exists else 'создан'}")
+            elif op.get("op") == "settings":
+                body = {k: ("" if v is None or str(v).strip() == "-" else v) for k, v in op.items() if k != "op"}
+                ai = request(cfg, "PATCH", "/api/settings", body)["ai"]
+                print(f"{i}. Пульт: модель ИИ {ai['model'] or 'не задана'}, усилие {ai['effort'] or 'не задано'}")
             else:
                 print(f"{i}. {run_op(cfg, op)}")
         except Conflict as e:
@@ -839,9 +809,12 @@ def cmd_apply(cfg, args):
     return 1 if failed else 0
 
 
+CLI_FIELDS = ("project", "title", "status", "holder", "next", "wait", "check", "due", "notes", "mem", "prompt",
+              "model", "effort")
+
+
 def cmd_add(cfg, args):
-    raw = {k: getattr(args, k) for k in ("project", "title", "status", "holder", "next", "wait", "check", "due",
-                                         "notes", "mem") if getattr(args, k) is not None}
+    raw = {k: getattr(args, k) for k in CLI_FIELDS if getattr(args, k) is not None}
     raw["op"] = "add"
     if args.message:
         raw["comment"] = args.message
@@ -849,8 +822,7 @@ def cmd_add(cfg, args):
 
 
 def cmd_set(cfg, args):
-    raw = {k: getattr(args, k) for k in ("project", "title", "status", "holder", "next", "wait", "check", "due",
-                                         "notes", "mem") if getattr(args, k) is not None}
+    raw = {k: getattr(args, k) for k in CLI_FIELDS if getattr(args, k) is not None}
     raw.update(op="set", key=args.key)
     if args.message:
         raw["comment"] = args.message
@@ -870,11 +842,6 @@ def cmd_note(cfg, args):
     print(run_op(cfg, {"op": "note", "key": args.key, "text": " ".join(args.text)}))
 
 
-def cmd_step(cfg, args):
-    arg = " ".join(args.arg)
-    print(run_op(cfg, {"op": "step", "key": args.key, args.action: arg}))
-
-
 def cmd_import(cfg, args):
     with open(args.file, encoding="utf-8-sig") as f:
         bundle = json.load(f)
@@ -890,9 +857,11 @@ def cmd_import(cfg, args):
         for k in DATE_FIELDS:
             if t.get(k) is not None:
                 t[k] = parse_date(t[k])
-        if t.get("checklist"):
-            t["checklist"] = [{"t": c, "on": False} if isinstance(c, str) else {"t": c["t"], "on": bool(c.get("on"))}
-                              for c in t["checklist"]]
+        steps = t.pop("checklist", None)
+        if steps:
+            # отдельного поля «Шаги» больше нет: пункты идут в конец описания, отмеченные — с галочкой
+            lines = [("☐ " + c) if isinstance(c, str) else ("☑ " if c.get("on") else "☐ ") + c["t"] for c in steps]
+            t["notes"] = ((t.get("notes") or "") + "\n\nШаги:\n" + "\n".join(lines)).strip()
         for k in ("next", "wait", "notes", "mem", "holder"):
             if t.get(k) is None:
                 t.pop(k, None)
@@ -1177,6 +1146,9 @@ def build_parser():
         x.add_argument("--due")
         x.add_argument("--notes")
         x.add_argument("--mem")
+        x.add_argument("--prompt", help="сообщение для ИИ; «-» — очистить")
+        x.add_argument("--model", help="модель ИИ для сессии по карточке; «-» — как у проекта")
+        x.add_argument("--effort", help="усилие ИИ; «-» — как у проекта")
         x.add_argument("-m", "--message", help="запись в журнал")
     d = sub.add_parser("done")
     d.add_argument("key")
@@ -1186,10 +1158,6 @@ def build_parser():
     n = sub.add_parser("note")
     n.add_argument("key")
     n.add_argument("text", nargs="+")
-    st = sub.add_parser("step")
-    st.add_argument("key")
-    st.add_argument("action", choices=("add", "check", "uncheck", "remove"))
-    st.add_argument("arg", nargs="+")
     im = sub.add_parser("import")
     im.add_argument("file")
     sub.add_parser("people", help="участники, доступ, входы")
@@ -1229,7 +1197,7 @@ def build_parser():
 
 COMMANDS = {"brief": cmd_brief, "ls": cmd_ls, "find": cmd_find, "show": cmd_show, "log": cmd_log,
             "projects": cmd_projects, "url": cmd_url, "whoami": cmd_whoami, "apply": cmd_apply, "add": cmd_add,
-            "set": cmd_set, "done": cmd_done, "note": cmd_note, "step": cmd_step, "import": cmd_import,
+            "set": cmd_set, "done": cmd_done, "note": cmd_note, "import": cmd_import,
             "people": cmd_people, "person": cmd_person, "grant": cmd_grant, "invite": cmd_invite, "key": cmd_key,
             "revoke": cmd_revoke, "digest": cmd_digest, "attach": cmd_attach, "fetch": cmd_fetch,
             "detach": cmd_detach}

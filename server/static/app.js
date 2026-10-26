@@ -21,7 +21,7 @@
   let query = "", showAllClosed = false, logActor = "", passOpen = false, lastFocus = null;
   let cardSeq = 0, logSeq = 0, peopleSeq = 0, toastTimer = 0;
   let P = null, pcard = null, pmode = "view", pid = null, secret = null;
-  let boardWho = "", drag = null, suppressClick = 0, waitEdit = null;
+  let boardWho = "", drag = null, suppressClick = 0, waitEdit = null, aiEdit = null;
   let uploads = [], upSeq = 0, pumping = false, dropDepth = 0;
 
   const $ = id => document.getElementById(id);
@@ -72,9 +72,8 @@
   const ICON_PEOPLE = '<svg class="vi" viewBox="0 0 16 16" aria-hidden="true"><circle cx="6" cy="5.5" r="2.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M1.8 13.5c.5-2.2 2.1-3.4 4.2-3.4s3.7 1.2 4.2 3.4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="11.4" cy="6.3" r="1.8" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M11.1 10.2c1.6 0 2.8.9 3.2 2.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
   const ICON_BOARD = '<svg class="vi" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.8" y="2.3" width="3.6" height="11.4" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="6.2" y="2.3" width="3.6" height="7.6" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="10.6" y="2.3" width="3.6" height="9.4" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>';
   const CLIP = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M10.6 5.4l-4.7 4.7a1.4 1.4 0 0 0 2 2l5-5a2.8 2.8 0 0 0-4-4l-5 5a4.2 4.2 0 0 0 6 6l4-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-  const STEPS = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.3" y="2.3" width="11.4" height="11.4" rx="2.6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.2 8.2l1.9 1.9 3.7-4.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const MSG = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1.2 1.2 0 0 1 1.2 1.2v5.6A1.2 1.2 0 0 1 13 11H7.4L4.2 13.6V11H3a1.2 1.2 0 0 1-1.2-1.2V4.2A1.2 1.2 0 0 1 3 3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
   const FILEICON = '<svg class="fico" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 1.8h5l3.2 3.2v9.2H4z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M9 1.8V5h3.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
-  const CHECK = '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6.2l2.3 2.3 4.7-5" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   const XICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 3.5l9 9M12.5 3.5l-9 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
 
   const QUICK = [
@@ -138,7 +137,7 @@
   const visibleProjects = a => a.projects.filter(p => !p.archived);
   // Журнал и участники грузятся отдельно — их не перерисовываем на каждое изменение задач;
   // доску не перерисовываем, пока по ней тащат карточку
-  const liveMain = () => route.view !== "log" && route.view !== "people" && !(drag && drag.on);
+  const liveMain = () => route.view !== "log" && route.view !== "people" && !(drag && drag.on) && !aiEdit;
 
   function applyTask(task) {
     const lite = Object.assign({}, task, {has_notes: !!task.notes});
@@ -205,8 +204,53 @@
   }
   function matches(t, ts) {
     const p = PROJ[t.project], a = AREA_OF[t.project];
-    const hay = norm([t.key, t.title, a ? a.name : "", p ? p.name : "", t.next, t.wait, t.holder ? actorName(t.holder) : ""].join(" "));
+    const hay = norm([t.key, t.title, a ? a.name : "", p ? p.name : "", t.next, t.wait, t.prompt, t.holder ? actorName(t.holder) : ""].join(" "));
     return ts.every(w => hay.includes(w));
+  }
+
+  // Модель и усилие для сессии ИИ по карточке: карточка → проект → раздел → весь Пульт, нижний уровень главнее.
+  const AI_FROM = {task: "в карточке", project: "из проекта", area: "из раздела", pult: "для всего Пульта"};
+  const AI_ABOVE = {task: "как у проекта", project: "как у раздела", area: "как у Пульта", pult: ""};
+  const AI_LISTS = '<datalist id="ai-models">' + ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"].map(v => '<option value="' + v + '">').join("") +
+    '</datalist><datalist id="ai-efforts">' + ["low", "medium", "high", "xhigh", "max"].map(v => '<option value="' + v + '">').join("") + '</datalist>';
+  function aiChain(kind, x) {
+    const pult = ["pult", S.ai || {}];
+    if (kind === "pult") return [pult];
+    if (kind === "area") return [["area", x], pult];
+    if (kind === "project") return [["project", x]].concat(aiChain("area", x && AREA_OF[x.id]));
+    return [["task", x]].concat(aiChain("project", PROJ[x.project] || null));
+  }
+  function aiPick(levels) {
+    const out = {};
+    ["model", "effort"].forEach(k => {
+      const hit = levels.find(l => l[1] && l[1][k]);
+      out[k] = hit ? hit[1][k] : "";
+      out[k + "From"] = hit ? hit[0] : "";
+    });
+    return out;
+  }
+  function aiHTML(ai) {
+    return ["model", "effort"].filter(k => ai[k]).map(k => '<span>' + (k === "model" ? "модель " : "усилие ") + '<span class="mono">' + esc(ai[k]) + '</span> <span class="muted">' + AI_FROM[ai[k + "From"]] + '</span></span>').join("");
+  }
+  // поля модели и усилия; в подсказке — что достанется с уровня выше, если оставить пустым
+  function aiInputs(kind, own, above) {
+    const ph = (k, none) => above[k] ? (AI_ABOVE[kind] + ": " + above[k]) : none;
+    return '<div class="row2"><label class="f"><span>Модель ИИ</span><input class="inp mono" name="model" list="ai-models" maxlength="60" value="' + esc(own.model || "") + '" placeholder="' + esc(ph("model", "не задана")) + '" autocomplete="off" spellcheck="false"></label>' +
+      '<label class="f"><span>Усилие ИИ</span><input class="inp mono" name="effort" list="ai-efforts" maxlength="60" value="' + esc(own.effort || "") + '" placeholder="' + esc(ph("effort", "не задано")) + '" autocomplete="off" spellcheck="false"></label></div>' + AI_LISTS;
+  }
+  const scopeKey = r => r.view === "all" ? "pult" : r.view === "a" || r.view === "p" ? r.view + ":" + r.id : null;
+  // строка «ИИ: …» в шапке раздела, проекта или всех задач; владелец меняет её на месте
+  function aiHead(kind, x) {
+    const key = kind === "pult" ? "pult" : (kind === "area" ? "a:" : "p:") + x.id;
+    const own = kind === "pult" ? (S.ai || {}) : x;
+    if (aiEdit === key && OWNER) {
+      return '<form class="aiform" data-form="ai" data-scope="' + esc(key) + '" novalidate>' + aiInputs(kind, own, aiPick(aiChain(kind, x).slice(1))) +
+        '<div class="formbar"><button class="btn primary small" type="submit">Сохранить</button><button class="btn small" type="button" data-aicancel>Отмена</button></div></form>';
+    }
+    const ai = aiPick(aiChain(kind, x)), shown = aiHTML(ai);
+    if (!shown && !OWNER) return "";
+    return '<p class="ai-line"><span class="muted">ИИ для сессий по карточкам:</span>' + (shown || '<span class="muted">не задано</span>') +
+      (OWNER ? '<button class="linkbtn" type="button" data-aiedit="' + esc(key) + '">изменить</button>' : "") + '</p>';
   }
   // «Кто держит»: те, кто правит проект; владелец может назначить и остальных — с пометкой
   function holderChoices(projectId, current) {
@@ -266,7 +310,7 @@
       const a = AREA[r.id];
       if (!a) return '<header class="mhead"><h1>Нет такого раздела</h1></header>';
       const k = visibleProjects(a).length;
-      return '<header class="mhead"><div class="crumbs">Раздел</div><h1>' + esc(a.name) + '</h1><p>' + k + ' ' + plural(k, "проект", "проекта", "проектов") + ' · открытых задач ' + openN + (a.closed ? " · закрытый раздел" : "") + '</p></header>';
+      return '<header class="mhead"><div class="crumbs">Раздел</div><h1>' + esc(a.name) + '</h1><p>' + k + ' ' + plural(k, "проект", "проекта", "проектов") + ' · открытых задач ' + openN + (a.closed ? " · закрытый раздел" : "") + '</p>' + aiHead("area", a) + '</header>';
     }
     if (r.view === "p") {
       const p = PROJ[r.id];
@@ -276,19 +320,19 @@
       if (p.shared) bits.push("общий: " + p.shared);
       if (!canEdit(p.id)) bits.push("у вас — только чтение");
       const refs = [p.mem ? "память: " + p.mem : "", p.path ? "папка: " + p.path : ""].filter(Boolean).join(" · ");
-      return '<header class="mhead"><div class="mhead-row"><div class="mhead"><div class="crumbs">' + (a ? '<button class="linkbtn" type="button" data-nav="a:' + esc(a.id) + '">' + esc(a.name) + '</button>' : "") + '</div><h1>' + esc(p.name) + '</h1><p>' + esc(bits.join(" · ")) + '</p>' + (refs ? '<p class="mono">' + esc(refs) + '</p>' : "") + '</div>' +
+      return '<header class="mhead"><div class="mhead-row"><div class="mhead"><div class="crumbs">' + (a ? '<button class="linkbtn" type="button" data-nav="a:' + esc(a.id) + '">' + esc(a.name) + '</button>' : "") + '</div><h1>' + esc(p.name) + '</h1><p>' + esc(bits.join(" · ")) + '</p>' + (refs ? '<p class="mono">' + esc(refs) + '</p>' : "") + aiHead("project", p) + '</div>' +
         '<div class="actions"><button class="btn small" type="button" data-board="p:' + esc(p.id) + '">' + ICON_BOARD + 'Доской</button>' + (canEdit(p.id) ? '<button class="btn small" type="button" data-new="' + esc(p.id) + '">+ Задача в проект</button>' : "") + '</div></div></header>';
     }
-    return '<header class="mhead"><div class="crumbs">Все проекты</div><h1>Все задачи</h1><p>Открытых ' + openN + ', закрытых ' + closedN + '. Сверху то, что требует внимания.</p></header>';
+    return '<header class="mhead"><div class="crumbs">Все проекты</div><h1>Все задачи</h1><p>Открытых ' + openN + ', закрытых ' + closedN + '. Сверху то, что требует внимания.</p>' + (r.view === "all" ? aiHead("pult", null) : "") + '</header>';
   }
 
   function trow(t, ts) {
     const p = PROJ[t.project], a = AREA_OF[t.project], st = stepText(t);
     const where = (a ? a.name + " › " : "") + (p ? p.name : t.project);
-    const steps = (t.checklist && t.checklist.length ? " · шаги " + t.checklist.filter(c => c.on).length + "/" + t.checklist.length : "") +
+    const extra = (t.prompt ? " · сообщение для ИИ" : "") +
       (t.files ? " · " + t.files + " " + plural(t.files, "вложение", "вложения", "вложений") : "");
     return '<button class="trow' + (t.key === openKey ? " on" : "") + '" type="button" data-task="' + esc(t.key) + '"><span class="tid">' + hl(t.key, ts) + '</span>' +
-      '<span class="tt"><span class="t">' + hl(t.title, ts) + '</span><span class="meta">' + hl(where + (st ? " · " + st : ""), ts) + esc(steps) + '</span></span>' +
+      '<span class="tt"><span class="t">' + hl(t.title, ts) + '</span><span class="meta">' + hl(where + (st ? " · " + st : ""), ts) + esc(extra) + '</span></span>' +
       '<span class="dslot">' + dateChip(t) + '</span>' + av(t.holder) + '</button>';
   }
   const group = (k, label, items, ts) => '<section class="group"><div class="gtitle"><i class="lamp ' + k + '"></i>' + esc(label) + '<span class="n">' + items.length + '</span></div>' + items.map(t => trow(t, ts)).join("") + '</section>';
@@ -376,13 +420,13 @@
 
   function bcard(t, ts, oneProject) {
     const p = PROJ[t.project];
-    const steps = t.checklist && t.checklist.length ? '<span title="Шаги">' + STEPS + t.checklist.filter(c => c.on).length + "/" + t.checklist.length + '</span>' : "";
+    const ask = t.prompt ? '<span title="Сообщение для ИИ">' + MSG + 'ИИ</span>' : "";
     const files = t.files ? '<span title="Вложения">' + CLIP + t.files + '</span>' : "";
     return '<button class="bcard' + (isLate(t) ? " late" : "") + (isOpen(t) ? "" : " closed") + (t.key === openKey ? " on" : "") + '" type="button" data-task="' + esc(t.key) + '"' + (canEdit(t.project) ? " data-drag" : "") + '>' +
       '<span class="bc-top"><span class="tid">' + hl(t.key, ts) + '</span>' + dateChip(t) + '</span>' +
       '<span class="bc-t">' + hl(t.title, ts) + '</span>' +
       (oneProject ? "" : '<span class="bc-p">' + hl((AREA_OF[t.project] ? AREA_OF[t.project].name + " › " : "") + (p ? p.name : t.project), ts) + '</span>') +
-      '<span class="bc-foot">' + steps + files + av(t.holder) + '</span></button>';
+      '<span class="bc-foot">' + ask + files + av(t.holder) + '</span></button>';
   }
 
   function renderBoard() {
@@ -995,6 +1039,8 @@
       ((a && a.closed) || (p && p.closed) ? '<span class="muted">' + LOCK + 'закрытый</span>' : "") + (p && p.shared ? '<span class="muted">' + SHARED + 'общий: ' + esc(p.shared) + '</span>' : "") + '</dd>';
     const mem = t.mem || (p && p.mem);
     if (mem) f += '<dt>Подробности</dt><dd><span class="mono">' + esc(mem) + '</span></dd>';
+    const ai = aiHTML(aiPick(aiChain("task", t)));
+    if (ai) f += '<dt>ИИ</dt><dd>' + ai + '</dd>';
     f += '<dt>Создана</dt><dd><span class="muted">' + esc(stamp(t.created_at)) + ', ' + esc(actorName(t.created_by)) + '</span></dd></dl>';
 
     const pass = passOpen && can ? '<div class="picker" role="group" aria-label="Кому передать">' + holderChoices(t.project, t.holder).map(({a: x, noacc}) => '<button class="chipbtn' + (noacc ? " noacc" : "") + '" type="button" data-holder="' + esc(x.id) + '" aria-pressed="' + (t.holder === x.id) + '"' + (noacc ? ' title="Не правит этот проект: задачу не увидит"' : "") + '>' + av(x.id) + esc(x.name) + (noacc ? " · нет доступа" : "") + '</button>').join("") +
@@ -1003,22 +1049,12 @@
       ? '<div class="actions">' + (t.holder !== S.me.id ? '<button class="btn primary" type="button" data-take>Взять себе</button>' : "") +
         '<button class="btn" type="button" data-pass aria-expanded="' + passOpen + '">Передать</button><button class="btn" type="button" data-edit>Изменить</button><button class="btn" type="button" data-copy>Ссылка</button></div>' + pass
       : '<div class="actions"><button class="btn" type="button" data-copy>Ссылка</button><span class="muted">Только чтение: права править задачи этого проекта у вас нет.</span></div>';
+    const ask = t.prompt ? '<section class="ask"><h3 class="subhead">' + MSG + 'Сообщение для ИИ</h3><p class="notes">' + linkify(t.prompt) + '</p></section>' : "";
     const notes = t.notes ? '<section><h3 class="subhead">Описание</h3><p class="notes">' + linkify(t.notes) + '</p></section>' : "";
-    const done = t.checklist.filter(c => c.on).length;
-    const box = c => '<span class="box' + (c.on ? " on" : "") + '">' + (c.on ? CHECK : "") + '</span><span class="ct">' + esc(c.t) + '</span>';
-    const steps = '<section><h3 class="subhead">Шаги' + (t.checklist.length ? " · " + done + " из " + t.checklist.length : "") + '</h3>' +
-      (t.checklist.length ? '<ul class="checklist">' + t.checklist.map((c, i) => '<li>' + (can
-        ? '<button class="cbtn' + (c.on ? " on" : "") + '" type="button" data-step="' + i + '" aria-pressed="' + c.on + '">' + box(c) + '</button>'
-        : '<span class="cbtn ro' + (c.on ? " on" : "") + '">' + box(c) + '</span>') + '</li>').join("") + '</ul>' : (can ? "" : '<p class="muted">Шагов нет.</p>')) +
-      (can ? '<form class="addstep" data-form="addstep"><input class="inp" name="t" maxlength="300" placeholder="Новый шаг" autocomplete="off" aria-label="Новый шаг"><button class="btn small" type="submit">Добавить</button></form>' : "") + '</section>';
     const comment = can ? '<form class="comment" data-form="comment"><textarea class="ta short" name="text" maxlength="4000" placeholder="Запись в журнал: что сделано, что решили" aria-label="Запись в журнал"></textarea><div><button class="btn small" type="submit">Записать в журнал</button></div></form>' : "";
     const jr = card.journal.length ? '<ol class="journal">' + card.journal.map(e => '<li>' + av(e.actor) + '<div>' + jentry(e, false) + '</div></li>').join("") + '</ol>' : '<p class="muted">Записей пока нет.</p>';
     return drawerHead(t.key) + '<div class="task"><div class="task-top"><div class="crumbs">' + (a ? esc(a.name) + ' › ' : "") + esc(p ? p.name : t.project) + '</div><h2>' + esc(t.title) + '</h2></div>' +
-      f + acts + notes + steps + filesHTML(can) + '<section><h3 class="subhead">Журнал</h3>' + comment + '</section>' + jr + '</div>';
-  }
-
-  function stepRow(c) {
-    return '<li><input type="checkbox" name="s_on"' + (c && c.on ? " checked" : "") + ' aria-label="выполнен"><input class="inp" name="s_t" maxlength="300" value="' + esc(c ? c.t : "") + '" aria-label="шаг" autocomplete="off"><button class="iconbtn" type="button" data-rmrow aria-label="Убрать шаг">' + XICON + '</button></li>';
+      f + acts + ask + notes + filesHTML(can) + '<section><h3 class="subhead">Журнал</h3>' + comment + '</section>' + jr + '</div>';
   }
 
   function formHTML(t, isNew) {
@@ -1038,10 +1074,11 @@
       '<div class="row2"><label class="f"><span>Держит</span><select class="sel" name="holder">' + holderOpts + '</select></label>' +
       '<label class="f"><span>Срок</span><input class="inp" type="date" name="due" value="' + esc(t.due || "") + '"></label></div>' +
       '<label class="f"><span>Следующий шаг</span><textarea class="ta short" name="next" maxlength="500">' + esc(t.next || "") + '</textarea></label>' +
+      '<label class="f"><span>Сообщение для ИИ</span><textarea class="ta short" name="prompt" maxlength="4000" placeholder="что сделать ИИ, который возьмёт карточку: прочтёт первым в начале сессии">' + esc(t.prompt || "") + '</textarea></label>' +
       '<div class="row2"><label class="f"><span>Ждём</span><input class="inp" name="wait" maxlength="500" value="' + esc(t.wait || "") + '" placeholder="кого или чего" autocomplete="off"></label>' +
       '<label class="f"><span>Проверить</span><input class="inp" type="date" name="check" value="' + esc(t.check || "") + '"></label></div>' +
       '<label class="f"><span>Описание</span><textarea class="ta" name="notes" maxlength="20000" rows="6">' + esc(t.notes || "") + '</textarea></label>' +
-      '<div class="f"><span>Шаги</span><ul class="steps-edit">' + (t.checklist || []).map(stepRow).join("") + '</ul><div><button class="btn small" type="button" data-addrow>+ шаг</button></div></div>' +
+      aiInputs("task", t, aiPick(aiChain("project", PROJ[t.project] || null))) +
       '<label class="f"><span>Подробности</span><input class="inp mono" name="mem" maxlength="500" value="' + esc(t.mem || "") + '" placeholder="файл памяти или папка" autocomplete="off"></label>' +
       '<label class="f"><span>Запись в журнал</span><input class="inp" name="comment" maxlength="4000" placeholder="необязательно: почему меняем" autocomplete="off"></label>' +
       '<div class="formbar"><button class="btn primary" type="submit">' + (isNew ? "Создать" : "Сохранить") + '</button><button class="btn" type="button" data-cancel>Отмена</button><span class="spacer"></span>' +
@@ -1050,12 +1087,11 @@
 
   function readForm(form) {
     const v = n => form.elements[n] ? form.elements[n].value : "";
-    const ons = [...form.querySelectorAll('input[name="s_on"]')], txts = [...form.querySelectorAll('input[name="s_t"]')];
     return {
       title: v("title").trim(), project: v("project"), status: v("status"), holder: v("holder") || null,
       due: v("due") || null, next: v("next").trim(), wait: v("wait").trim(), check: v("check") || null,
-      notes: v("notes").trim(), mem: v("mem").trim(), comment: v("comment").trim(),
-      checklist: txts.map((x, i) => ({t: x.value.trim(), on: ons[i].checked})).filter(c => c.t)
+      notes: v("notes").trim(), mem: v("mem").trim(), prompt: v("prompt").trim(), model: v("model").trim(),
+      effort: v("effort").trim(), comment: v("comment").trim()
     };
   }
 
@@ -1085,8 +1121,7 @@
     const f = readForm(form), t = card.task, body = {};
     if (!f.title) { toast("Нужно название", true); form.elements.title.focus(); return; }
     const same = (x, y) => (x == null ? "" : x) === (y == null ? "" : y);
-    ["title", "project", "status", "holder", "due", "next", "wait", "check", "notes", "mem"].forEach(k => { if (!same(f[k], t[k])) body[k] = f[k]; });
-    if (JSON.stringify(f.checklist) !== JSON.stringify(t.checklist)) body.checklist = f.checklist;
+    ["title", "project", "status", "holder", "due", "next", "wait", "check", "notes", "mem", "prompt", "model", "effort"].forEach(k => { if (!same(f[k], t[k])) body[k] = f[k]; });
     if (f.comment) body.comment = f.comment;
     if (!Object.keys(body).length) { mode = "view"; renderCard(); return; }
     await busy(form, patchTask(body, "Сохранено"));
@@ -1116,7 +1151,7 @@
       const ok = id => PROJ[id] && canEdit(id);
       const r = route.view === "board" ? (splitScope(route.id) || {view: "all"}) : route;
       const pid0 = r.view === "p" && ok(r.id) ? r.id : r.view === "a" && AREA[r.id] ? ((visibleProjects(AREA[r.id]).find(p => canEdit(p.id)) || {}).id || "") : "";
-      newDefaults = {project: pid0, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: "", checklist: []};
+      newDefaults = {project: pid0, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: "", prompt: "", model: "", effort: ""};
     }
     openKey = null; card = null; mode = "new"; ++cardSeq;
     pid = null; pcard = null; secret = null;
@@ -1128,7 +1163,7 @@
 
   function newTask(projectId) {
     newDefaults = null;
-    if (projectId && PROJ[projectId]) newDefaults = {project: projectId, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: "", checklist: []};
+    if (projectId && PROJ[projectId]) newDefaults = {project: projectId, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: "", prompt: "", model: "", effort: ""};
     location.hash = hashFor(route, "new");
   }
 
@@ -1166,6 +1201,7 @@
       route = task ? {view: "p", id: task.project} : {view: "all"};
     } else route = {view: "all"};
     if (route.view !== "all" && route.view !== "q" && route.view !== "a" && route.view !== "p") showAllClosed = false;
+    if (aiEdit && aiEdit !== scopeKey(route)) aiEdit = null;
     renderSide();
     if (u) { if (u !== pid || $("drawer").hidden) openPerson(u); }
     else if (t === "new") { if (mode !== "new" || $("drawer").hidden) openNew(); }
@@ -1204,7 +1240,7 @@
 
   // ---------- события ----------
 
-  const CLICKS = "[data-nav],[data-task],[data-close],[data-reset],[data-more-closed],[data-status],[data-take],[data-pass],[data-holder],[data-edit],[data-cancel],[data-step],[data-copy],[data-del],[data-addrow],[data-rmrow],[data-logactor],[data-new],[data-me],[data-logout]," +
+  const CLICKS = "[data-nav],[data-task],[data-close],[data-reset],[data-more-closed],[data-status],[data-take],[data-pass],[data-holder],[data-edit],[data-cancel],[data-copy],[data-del],[data-rmrow],[data-aiedit],[data-aicancel],[data-logactor],[data-new],[data-me],[data-logout]," +
     "[data-person],[data-pnew],[data-ungrant],[data-role],[data-revoke-key],[data-revoke-invite],[data-copy-secret],[data-pedit],[data-active],[data-addgrant],[data-board],[data-attach],[data-fdel]";
 
   document.addEventListener("click", ev => {
@@ -1264,11 +1300,12 @@
     } else if (d.cancel !== undefined) {
       if (pid !== null) { if (pmode === "new") closeTask(); else { pmode = "view"; renderPerson(); } }
       else if (mode === "new") closeTask(); else { mode = "view"; renderCard(); }
-    } else if (d.step !== undefined && card) {
-      const list = card.task.checklist.map(c => Object.assign({}, c)), i = Number(d.step);
-      if (!list[i]) return;
-      list[i].on = !list[i].on;
-      patchTask({checklist: list});
+    } else if (d.aiedit !== undefined) {
+      aiEdit = d.aiedit; renderMain();
+      const m = $("main").querySelector('form[data-form="ai"] input[name="model"]');
+      if (m) m.focus();
+    } else if (d.aicancel !== undefined) {
+      aiEdit = null; renderMain();
     } else if (d.copy !== undefined && card) {
       copyText(location.origin + "/#t=" + encodeURIComponent(card.task.key));
     } else if (d.del !== undefined && card) {
@@ -1281,10 +1318,6 @@
         closeTask();
         renderSide(); renderMain();
       }, e => toast(e.message, true));
-    } else if (d.addrow !== undefined) {
-      const ul = el.closest(".f").querySelector(".steps-edit");
-      ul.insertAdjacentHTML("beforeend", stepRow(null));
-      ul.lastElementChild.querySelector('input[name="s_t"]').focus();
     } else if (d.addgrant !== undefined) {
       el.closest(".f").querySelector(".grants-edit").insertAdjacentHTML("beforeend", grantRow());
     } else if (d.rmrow !== undefined) {
@@ -1336,10 +1369,11 @@
       busy(form, api("POST", "/api/task/" + encodeURIComponent(card.task.key) + "/comment", {text})
         .then(r => { card.task = r.task; applyTask(r.task); return reloadCard(); })
         .then(() => toast("Записано в журнал"), e => toast(e.message, true)));
-    } else if (kind === "addstep" && card) {
-      const text = form.elements.t.value.trim();
-      if (!text) return;
-      busy(form, patchTask({checklist: card.task.checklist.concat([{t: text, on: false}])}, "Шаг добавлен"));
+    } else if (kind === "ai") {
+      const scope = form.dataset.scope, body = {model: form.elements.model.value.trim(), effort: form.elements.effort.value.trim()};
+      const path = scope === "pult" ? "/api/settings" : "/api/" + (scope[0] === "a" ? "area/" : "project/") + encodeURIComponent(scope.slice(2));
+      busy(form, api("PATCH", path, body).then(() => { aiEdit = null; etag = null; return refresh(true); })
+        .then(() => { if (card && mode === "view" && !$("drawer").hidden) renderCard(); toast("Сохранено"); }, e => toast(e.message, true)));
     } else if (kind === "edit" && card) saveEdit(form);
     else if (kind === "new") saveNew(form);
     else if (kind === "pnew") saveNewPerson(form);

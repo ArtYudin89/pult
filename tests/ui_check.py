@@ -193,22 +193,27 @@ try:
         check(True, "кнопка «Доской» в проекте ведёт на доску проекта")
 
         # ---------- вложения ----------
+        # у INF-30 на боевой копии уже есть свои вложения (их файлов в копии нет — отсюда 404 в консоли):
+        # проверки считают прибавку к ним
+        before = call("GET", "/api/task/INF-30")["files"]
+        n0, imgs0 = len(before), sum(1 for f in before if f["image"])
         page.goto(base + "/#t=INF-30")
         page.wait_for_selector("#drawer [data-attach]")
         page.set_input_files("#file-input", [PNG_PATH, TXT_PATH])
-        page.wait_for_selector("#drawer .thumb img")
+        page.wait_for_selector('#drawer .thumb img[alt="Схема доски.png"]')
         page.wait_for_selector("#drawer .flist li")
         nw = 0
         for _ in range(50):
-            nw = page.evaluate("() => { const i = document.querySelector('#drawer .thumb img'); return i ? i.naturalWidth : 0; }")
+            nw = page.evaluate("() => { const i = document.querySelector('#drawer .thumb img[alt=\"Схема доски.png\"]'); return i ? i.naturalWidth : 0; }")
             if nw == 320:
                 break
             time.sleep(0.1)
         check(nw == 320, f"картинка прикреплена и показана, CSP не мешает (ширина {nw})")
         files = call("GET", "/api/task/INF-30")["files"]
-        check([f["name"] for f in files] == ["Схема доски.png", "crash.log"], f"на сервере: {[f['name'] for f in files]}")
+        check([f["name"] for f in files][n0:] == ["Схема доски.png", "crash.log"], f"на сервере: {[f['name'] for f in files]}")
         page.locator("#drawer").screenshot(path=os.path.join(out, "04_card_files.png"))
-        resp = page.request.get(base + f"/api/file/{files[1]['id']}?dl=1")
+        log_id = next(f["id"] for f in files if f["name"] == "crash.log")
+        resp = page.request.get(base + f"/api/file/{log_id}?dl=1")
         check(resp.headers.get("content-disposition", "").startswith("attachment") and resp.body() == open(TXT_PATH, "rb").read(),
               "лог отдаётся на скачивание, байты целы (cp1251)")
         # удалить лог: два нажатия
@@ -216,12 +221,12 @@ try:
         check(page.locator("#drawer .flist [data-fdel]").inner_text() == "Точно?", "удаление спрашивает подтверждение")
         page.click("#drawer .flist [data-fdel]")
         page.wait_for_selector("#drawer .flist", state="detached")
-        check(len(call("GET", "/api/task/INF-30")["files"]) == 1, "лог удалён")
+        check(len(call("GET", "/api/task/INF-30")["files"]) == n0 + 1, "лог удалён")
         # вставка скриншота из буфера
         page.evaluate("""() => { const b = new Uint8Array([137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82]);
             const dt = new DataTransfer(); dt.items.add(new File([b], 'image.png', {type: 'image/png'}));
             document.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true})); }""")
-        page.wait_for_selector("#drawer .thumb >> nth=1")
+        page.wait_for_selector(f"#drawer .thumb >> nth={imgs0 + 1}")
         names = [f["name"] for f in call("GET", "/api/task/INF-30")["files"]]
         check(names[-1].startswith("скриншот ") and names[-1].endswith(".png"), f"Ctrl+V: скриншот с датой в имени ({names[-1]})")
         # файл, брошенный на карточку
@@ -238,12 +243,59 @@ try:
         page.goto(base + "/#all")
         page.fill("#q", "INF-30")
         page.wait_for_selector(".qbar")
-        check("3 вложения" in page.locator(".trow").first.inner_text(), "в списке: «3 вложения» у задачи")
+        check(f"{n0 + 3} вложени" in page.locator(".trow").first.inner_text(), f"в списке: «{n0 + 3} вложения» у задачи")
         page.fill("#q", "")
         page.goto(base + "/#board")
         page.wait_for_selector(".bcol")
         bc = page.locator('.bcard[data-task="INF-30"]')
-        check(bc.count() == 1 and "3" in bc.locator(".bc-foot").inner_text(), "на доске: скрепка с числом вложений")
+        check(bc.count() == 1 and str(n0 + 3) in bc.locator(".bc-foot").inner_text(), "на доске: скрепка с числом вложений")
+
+        # ---------- сообщение для ИИ, модель и усилие по уровням ----------
+        page.goto(base + "/#all")
+        page.wait_for_selector('[data-aiedit="pult"]')
+        page.click('[data-aiedit="pult"]')
+        page.fill('form[data-form="ai"] input[name="model"]', "claude-opus-5-5")
+        page.fill('form[data-form="ai"] input[name="effort"]', "high")
+        page.click('form[data-form="ai"] button[type="submit"]')
+        page.wait_for_selector('.ai-line:has-text("claude-opus-5-5")')
+        check(call("GET", "/api/state")["ai"] == {"model": "claude-opus-5-5", "effort": "high"},
+              "«Все задачи» → «изменить»: модель и усилие для всего Пульта сохранены")
+        proj = task("INF-30")["project"]
+        page.goto(base + "/#p=" + proj)
+        page.wait_for_selector(f'[data-aiedit="p:{proj}"]')
+        page.click(f'[data-aiedit="p:{proj}"]')
+        ph = page.get_attribute('form[data-form="ai"] input[name="model"]', "placeholder")
+        check(ph == "как у раздела: claude-opus-5-5", f"в проекте подсказка — что достанется сверху ({ph})")
+        page.fill('form[data-form="ai"] input[name="effort"]', "max")
+        page.click('form[data-form="ai"] button[type="submit"]')
+        page.wait_for_selector('.ai-line:has-text("из проекта")')
+        line = page.locator(".ai-line").inner_text()
+        check("claude-opus-5-5 для всего Пульта" in line and "max из проекта" in line, f"строка ИИ проекта: {line!r}")
+        page.screenshot(path=os.path.join(out, "11_project_ai.png"))
+        page.goto(base + f"/#p={proj}&t=INF-30")
+        page.wait_for_selector("#drawer .fields")
+        dd = page.locator('#drawer .fields dt:text-is("ИИ") + dd').inner_text()
+        check("claude-opus-5-5" in dd and "max" in dd and "из проекта" in dd, f"карточка: строка «ИИ» — {dd!r}")
+        page.click("#drawer [data-edit]")
+        page.wait_for_selector('#drawer textarea[name="prompt"]')
+        ph = page.get_attribute('#drawer input[name="effort"]', "placeholder")
+        check(ph == "как у проекта: max", f"в карточке подсказка усилия — с проекта ({ph})")
+        page.fill('#drawer textarea[name="prompt"]', "Проверь доску на телефоне и запиши, что неудобно")
+        page.fill('#drawer input[name="effort"]', "low")
+        page.locator("#drawer").screenshot(path=os.path.join(out, "12a_card_edit.png"))
+        page.click('#drawer form[data-form="edit"] button[type="submit"]')
+        page.wait_for_selector("#drawer .ask")
+        t30 = task("INF-30")
+        check((t30["prompt"], t30["effort"], t30["ai"]["effort_from"]) == ("Проверь доску на телефоне и запиши, что неудобно", "low", "task"),
+              "сообщение для ИИ и своё усилие карточки сохранены")
+        check("Проверь доску на телефоне" in page.locator("#drawer .ask").inner_text(), "блок «Сообщение для ИИ» в карточке")
+        check("Сообщение для ИИ: «Проверь доску на телефоне и запиши, что неудобно»" in page.locator("#drawer .journal").inner_text(),
+              "поручение в журнале целиком")
+        page.locator("#drawer").screenshot(path=os.path.join(out, "12_card_prompt.png"))
+        page.keyboard.press("Escape")
+        page.goto(base + "/#board")
+        page.wait_for_selector(".bcol")
+        check("ИИ" in page.locator('.bcard[data-task="INF-30"] .bc-foot').inner_text(), "на доске: значок сообщения для ИИ")
 
         # ---------- тёмная тема ----------
         dark = browser.new_context(viewport={"width": 1440, "height": 900}, locale="ru-RU", color_scheme="dark")
@@ -315,6 +367,14 @@ try:
         check(dw <= 400, f"телефон: карточка с вложениями по ширине ({dw}px)")
         pp.locator("#drawer [data-attach]").scroll_into_view_if_needed()
         pp.screenshot(path=os.path.join(out, "10_phone_card_files.png"))
+        pp.locator("#drawer .ask").scroll_into_view_if_needed()
+        pp.screenshot(path=os.path.join(out, "13_phone_card_prompt.png"))
+        pp.keyboard.press("Escape")
+        pp.goto(base + "/#p=" + proj)
+        pp.wait_for_selector(".ai-line")
+        mw = pp.evaluate("document.getElementById('main').scrollWidth")
+        check(mw <= 400, f"телефон: шапка проекта со строкой ИИ по ширине ({mw}px)")
+        pp.screenshot(path=os.path.join(out, "14_phone_project_ai.png"))
         browser.close()
 finally:
     proc.terminate()

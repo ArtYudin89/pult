@@ -88,6 +88,9 @@ if [ -n "$PULT_TG_TOKEN_FILE" ]; then
     echo "кому: $(runuser -u pult -- python3 "$APP/pult_server.py" admin --db "$DB" digest-list | tr '\n' ';')"
 fi
 if command -v curl >/dev/null 2>&1; then
+    # порт открывается не сразу: при старте сервер ещё и переводит базу на новую схему
+    i=0
+    while [ $i -lt 15 ] && ! curl -sk -o /dev/null "$PULT_URL/"; do i=$((i + 1)); sleep 1; done
     curl -s -o /dev/null -w "страница $PULT_URL с проверкой сертификата: %{http_code}\n" "$PULT_URL/" || true
     curl -s -o /dev/null -w "API без ключа: %{http_code} (ждём 401)\n" "$PULT_URL/api/state" || true
 fi

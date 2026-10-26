@@ -165,7 +165,7 @@ class PlainHttp(Base):
             {"project": "lab", "title": "Первая задача", "status": "next", "holder": "claude",
              "next": "сделать шаг", "source": "memory/project_sr_lab.md"},
             {"project": "ms", "title": "T-1: ждём конвейер", "status": "wait", "wait": "конвейер по MR",
-             "check": "2026-10-27", "checklist": [{"t": "открыть MR", "on": True}, {"t": "дождаться", "on": False}],
+             "check": "2026-10-27", "notes": "План: открыть MR, дождаться конвейера",
              "journal": [{"actor": "artem", "at": "2026-10-20T10:00:00+03:00", "text": "Старая запись"}]},
         ]}
         for i, a in enumerate(bundle["areas"]):
@@ -216,16 +216,50 @@ class PlainHttp(Base):
         self.assertEqual(ctx.exception.status, 409)
         self.assertEqual(ctx.exception.payload["task"]["next"], "кто-то успел")
 
-    def test_05_checklist_journal(self):
+    def test_05_prompt_and_ai_levels(self):
         t = self.api("GET", "/api/task/1C-1")["task"]
-        items = [{"t": "открыть MR", "on": True}, {"t": "дождаться", "on": True}, {"t": "влить", "on": False}]
-        self.api("PATCH", "/api/task/1C-1", {"checklist": items, "version": t["version"]})
-        e = self.api("GET", "/api/task/1C-1")["journal"][0]
-        self.assertEqual(e["changes"], ["Шаг «дождаться» — выполнен", "Добавлен шаг «влить»"])
-        self.assertEqual(srv.checklist_changes([{"t": "a", "on": False}, {"t": "b", "on": False}],
-                                               [{"t": "b", "on": False}, {"t": "a", "on": False}]),
-                         ["Шаги переставлены"])
-        self.assertEqual(srv.checklist_changes([{"t": "a", "on": False}], []), ["Убран шаг «a»"])
+        self.assertEqual((t["prompt"], t["model"], t["effort"]), ("", "", ""))
+        self.assertEqual(t["ai"], {"model": "", "model_from": "", "effort": "", "effort_from": ""})
+        ask = "проверь конвейер и напиши, что упало\nвторая строка " + "х" * 200
+        self.api("PATCH", "/api/task/1C-1", {"prompt": ask, "effort": "high", "version": t["version"]})
+        r = self.api("GET", "/api/task/1C-1")
+        self.assertEqual(r["task"]["prompt"], ask)
+        self.assertEqual(r["journal"][0]["changes"], [f"Сообщение для ИИ: «{ask}»", "Усилие ИИ: high"],
+                         "поручение — в журнал целиком, без сокращения")
+        # уровни: весь Пульт → раздел → проект → карточка; нижний главнее
+        self.assertEqual(self.api("PATCH", "/api/settings", {"model": "claude-sonnet-5-5", "effort": "medium"},
+                                  who="artem")["ai"], {"model": "claude-sonnet-5-5", "effort": "medium"})
+        self.api("PATCH", "/api/area/1c", {"model": "claude-opus-5-5"}, who="artem")
+        self.assertEqual(self.api("GET", "/api/task/1C-1")["task"]["ai"],
+                         {"model": "claude-opus-5-5", "model_from": "area", "effort": "high", "effort_from": "task"})
+        self.api("PATCH", "/api/project/ms", {"model": "claude-fable-5-1", "effort": "max"}, who="artem")
+        r = self.api("PATCH", "/api/task/1C-1", {"effort": ""})
+        self.assertEqual(r["task"]["ai"],
+                         {"model": "claude-fable-5-1", "model_from": "project", "effort": "max", "effort_from": "project"})
+        self.assertEqual(self.api("GET", "/api/task/1C-1")["journal"][0]["changes"], ["Усилие ИИ: как у проекта"])
+        st = self.api("GET", "/api/state")
+        self.assertEqual(st["ai"], {"model": "claude-sonnet-5-5", "effort": "medium"})
+        self.assertEqual({p["id"]: (p["model"], p["effort"]) for p in st["projects"]}["ms"], ("claude-fable-5-1", "max"))
+        self.assertEqual({a["id"]: a["model"] for a in st["areas"]}["1c"], "claude-opus-5-5")
+        self.assertEqual({x["key"]: x["prompt"] for x in st["tasks"]}["1C-1"], ask)
+        changes = [c for e in self.api("GET", "/api/journal?limit=5", who="artem")["journal"] for c in e["changes"]]
+        self.assertIn("Модель ИИ для всего Пульта: claude-sonnet-5-5", changes)
+        self.assertIn("Модель ИИ: claude-opus-5-5", changes)
+        # пустое на уровне — значение берётся выше, вплоть до «не задано»
+        self.api("PATCH", "/api/project/ms", {"model": "", "effort": ""}, who="artem")
+        self.api("PATCH", "/api/area/1c", {"model": ""}, who="artem")
+        self.api("PATCH", "/api/settings", {"model": "", "effort": ""}, who="artem")
+        self.assertEqual(self.api("GET", "/api/task/1C-1")["task"]["ai"],
+                         {"model": "", "model_from": "", "effort": "", "effort_from": ""})
+        for bad in ({"model": "opus 5"}, {"effort": "-high"}, {"model": "м" * 3}):
+            with self.assertRaises(cli.PultError, msg=bad) as ctx:
+                self.api("PATCH", "/api/task/1C-1", bad)
+            self.assertEqual(ctx.exception.status, 400, bad)
+        with self.assertRaises(cli.PultError) as ctx:
+            self.api("PATCH", "/api/settings", {"modle": "x"}, who="artem")
+        self.assertEqual(ctx.exception.status, 400)
+        self.api("PATCH", "/api/task/1C-1", {"prompt": ""})
+        self.assertEqual(self.api("GET", "/api/task/1C-1")["journal"][0]["changes"], ["Сообщение для ИИ: убрано"])
 
     def test_06_done_reopen(self):
         r = self.api("PATCH", "/api/task/SR-1", {"status": "done"})
@@ -244,6 +278,9 @@ class PlainHttp(Base):
             with self.assertRaises(cli.PultError, msg=bad) as ctx:
                 self.api("PATCH", "/api/task/SR-1", bad)
             self.assertEqual(ctx.exception.status, 400, bad)
+        with self.assertRaises(cli.PultError) as ctx:
+            self.api("PATCH", "/api/task/SR-1", {"checklist": []})
+        self.assertIn("поля «Шаги» больше нет", str(ctx.exception))
 
     def test_08_cookie_login_and_csrf(self):
         r, body = self.raw("POST", "/api/login", {"key": self.tok["artem"]})
@@ -327,7 +364,8 @@ class PlainHttp(Base):
         env = {"PULT_URL": self.url, "PULT_TOKEN": self.tok["claude"], "PULT_CONFIG": os.path.join(self.tmp, "no.json")}
         ops = [
             {"op": "add", "project": "kit", "title": "Задача из пакета", "status": "next", "holder": "me",
-             "next": "первый шаг", "check": "+3", "checklist": ["раз", "два"], "comment": "создал пакетом"},
+             "next": "первый шаг", "check": "+3", "prompt": "проверь пакет", "model": "claude-opus-5-5",
+             "comment": "создал пакетом"},
             {"op": "set", "key": "SR-1", "status": "ждёт", "wait": "ответ", "check": "завтра"},
             {"op": "note", "key": "SR-1", "text": "заметка из пакета"},
             {"op": "step", "key": "1C-1", "check": "влить"},
@@ -349,11 +387,11 @@ class PlainHttp(Base):
         self.assertEqual(rc, 1, out)
         self.assertIn("SR-4: создана", out)
         self.assertIn("ОШИБКА", out)
-        self.assertIn("выполнено 5 из 6", out)
+        self.assertIn("поля «Шаги» больше нет", out)
+        self.assertIn("выполнено 4 из 6", out)
         t = self.api("GET", "/api/task/SR-4")["task"]
-        self.assertEqual((t["holder"], len(t["checklist"])), ("claude", 2))
+        self.assertEqual((t["holder"], t["prompt"], t["model"]), ("claude", "проверь пакет", "claude-opus-5-5"))
         self.assertEqual(self.api("GET", "/api/task/SR-1")["task"]["status"], "wait")
-        self.assertTrue(self.api("GET", "/api/task/1C-1")["task"]["checklist"][2]["on"])
         done = self.api("GET", "/api/task/SR-3")["task"]
         self.assertEqual((done["status"], done["next"]), ("done", "сделано пакетом"))
         for argv, needle in ((("brief",), "Пульт ·"), (("ls", "--project", "lab"), "SR-1"),
@@ -564,9 +602,9 @@ class Concurrency(Base):
     def setUpClass(cls):
         super().setUpClass()
         cls.keys = cls.seed_tasks([
-            {"project": "lab", "title": "Общая задача", "status": "next", "checklist": ["раз", "два"]},
+            {"project": "lab", "title": "Общая задача", "status": "next"},
             {"project": "lab", "title": "Удаляемая", "status": "inbox"},
-            {"project": "lab", "title": "Для сессий", "status": "next", "checklist": ["альфа", "бета"]},
+            {"project": "lab", "title": "Для сессий", "status": "next"},
         ])
 
     def sess(self, who, session):
@@ -633,15 +671,10 @@ class Concurrency(Base):
         self.assertEqual(self.api("GET", f"/api/task/{key}")["task"]["status"], "wait")
         rc, out = self.run_cli("set", key, "--next", "дописал шаг", **env)
         self.assertEqual(rc, 0, "другое поле сливается: " + out)
-        t = self.api("GET", f"/api/task/{key}")["task"]
-        self.api("PATCH", f"/api/task/{key}", {"checklist": [{"t": "новый первый", "on": False}] + t["checklist"]},
-                 who="artem")
-        rc, out = self.run_cli("step", key, "check", "1", **env)
-        self.assertEqual(rc, 1, "шаг по номеру после чужой правки шагов: " + out)
-        rc, out = self.run_cli("step", key, "check", "бета", **env)
-        self.assertEqual(rc, 0, out)
-        self.assertEqual([c["on"] for c in self.api("GET", f"/api/task/{key}")["task"]["checklist"]],
-                         [False, False, True])
+        self.api("PATCH", f"/api/task/{key}", {"prompt": "поручение от Артёма"}, who="artem")
+        rc, out = self.run_cli("set", key, "--prompt", "-", **env)
+        self.assertEqual(rc, 1, "сообщение для ИИ поменяли после того, как сессия видела карточку: " + out)
+        self.assertIn("сообщение для ИИ", out)
         self.run_cli("show", key, **env)
         rc, out = self.run_cli("done", key, "--result", "закрыто после show", **env)
         self.assertEqual(rc, 0, "после show знание свежее: " + out)
@@ -757,13 +790,51 @@ class Migration(unittest.TestCase):
                 c.execute("INSERT INTO keys(hash, actor_id, created_at) VALUES ('k1', 'codex', '2026-10-26')")
             db.conn.close()
             db = srv.DB(path)
-            self.assertEqual(db.q1("SELECT v FROM meta WHERE k = 'schema'")[0], "3")
+            self.assertEqual(db.q1("SELECT v FROM meta WHERE k = 'schema'")[0], str(srv.SCHEMA_VERSION))
             self.assertEqual(db.actor("codex")["role"], "member")
             self.assertEqual(db.q1("SELECT COUNT(*) FROM files")[0], 0, "таблица вложений заведена")
             db.conn.close()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+
+    def test_stage3_steps_to_notes(self):
+        """Переход 3 → 4: пункты «Шагов» уходят в конец описания, отмеченные — с галочкой; столбец пустеет."""
+        tmp = tempfile.mkdtemp(prefix="pult_mig_")
+        try:
+            path = os.path.join(tmp, "stage3.db")
+            steps = json.dumps([{"t": "раз", "on": True}, {"t": "два", "on": False}], ensure_ascii=False)
+            one = json.dumps([{"t": "один", "on": False}], ensure_ascii=False)
+            with contextlib.closing(sqlite3.connect(path)) as c:
+                c.executescript(STAGE1_SCHEMA)
+                c.execute("UPDATE tasks SET notes = 'Суть задачи.', checklist = ? WHERE key = 'SR-1'", (steps,))
+                c.execute("INSERT INTO tasks(key, project_id, title, status, checklist, created_at, created_by, "
+                          "updated_at, updated_by) VALUES ('SR-2', 'lab', 'Без описания', 'next', ?, "
+                          "'2026-10-26', 'claude', '2026-10-26', 'claude')", (one,))
+                c.commit()
+            db = srv.DB(path)
+            rows = {r["key"]: r for r in db.q("SELECT key, notes, checklist, version FROM tasks")}
+            self.assertEqual(rows["SR-1"]["notes"], "Суть задачи.\n\nШаги (раньше были отдельным полем):\n☑ раз\n☐ два")
+            self.assertEqual(rows["SR-2"]["notes"], "Шаги (раньше были отдельным полем):\n☐ один")
+            self.assertEqual((rows["SR-1"]["checklist"], rows["SR-1"]["version"]), ("[]", 3))
+            self.assertEqual(db.rev(), 1, "страницы перечитают задачи")
+            claude = dict(db.actor("claude"), via="проверка", session="")
+            t = db.task(claude, "SR-1")["task"]
+            self.assertNotIn("checklist", t)
+            self.assertEqual((t["prompt"], t["model"], t["effort"]), ("", "", ""))
+            with self.assertRaises(srv.ApiError) as ctx:
+                db.update_task(claude, "SR-1", {"notes": "по старой версии", "version": 2})
+            self.assertEqual(ctx.exception.status, 409, "правка по версии до переноса не затирает перенесённые шаги")
+            with self.assertRaises(srv.ApiError) as ctx:
+                db.save_settings(dict(db.actor("guest"), via="проверка", session=""), {"model": "x"})
+            self.assertEqual(ctx.exception.status, 403, "весь Пульт настраивает только владелец")
+            db.conn.close()
+            db = srv.DB(path)
+            self.assertEqual(db.q1("SELECT notes FROM tasks WHERE key = 'SR-2'")[0],
+                             "Шаги (раньше были отдельным полем):\n☐ один", "повторный запуск ничего не дописывает")
+            db.conn.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + bytes(range(200))
 
@@ -1155,7 +1226,10 @@ class FreshInstall(unittest.TestCase):
         self.assertIn("P-1", out)
         self.assertIn("Подключить ИИ к Пульту", out)
         task = cli.request({"url": self.url, "token": self.read("claude.token")}, "GET", "/api/task/P-1")["task"]
-        self.assertEqual((task["holder"], task["status"], len(task["checklist"])), ("claude", "next", 4))
+        self.assertEqual((task["holder"], task["status"]), ("claude", "next"))
+        self.assertIn("По шагам:\n1. Открыть страницу по ссылке для входа", task["notes"])
+        self.assertTrue(task["prompt"])
+        self.assertIn("Сообщения для ИИ (1)", out)
 
     def test_i3_owner_logs_in_once(self):
         token = self.read("login-anya.txt").split("#i=")[1]

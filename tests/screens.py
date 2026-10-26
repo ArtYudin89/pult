@@ -91,8 +91,8 @@ try:
     apply([
         {"op": "add", "project": "site", "title": "Форма записи на приём", "status": "doing", "holder": "me",
          "next": "проверить отправку заявок в Telegram",
-         "notes": "Клиника хочет получать заявки сразу в рабочий чат. Форма — на странице «Врачи».",
-         "checklist": ["поля формы и подсказки", "проверка телефона", "отправка в Telegram", "письмо-подтверждение"],
+         "notes": "Клиника хочет получать заявки сразу в рабочий чат. Форма — на странице «Врачи».\n\n"
+                  "План: поля формы и подсказки, проверка телефона, отправка в Telegram, письмо-подтверждение.",
          "comment": "завёл по разговору с Аней"},
         {"op": "add", "project": "site", "title": "Перенести сайт на новый хостинг", "status": "wait", "holder": "anya",
          "wait": "доступ к панели хостинга от администратора клиники", "check": day(0)},
@@ -110,11 +110,8 @@ try:
          "wait": "образцы из магазина", "check": day(3)},
     ], claude)
     apply([
-        {"op": "step", "key": "W-1", "check": 1},
-        {"op": "step", "key": "W-1", "check": 2},
         {"op": "note", "key": "W-1", "text": "Маска телефона готова; бот для чата клиники заведён, жду токен от Ани"},
-        {"op": "step", "key": "P-1", "check": 1}, {"op": "step", "key": "P-1", "check": 2},
-        {"op": "step", "key": "P-1", "check": 3}, {"op": "step", "key": "P-1", "check": 4},
+        {"op": "set", "key": "P-1", "prompt": "-", "comment": "проекты и задачи заведены"},
         {"op": "done", "key": "P-1", "result": "читаю сводку в начале сессии и двигаю карточки в конце"},
     ], claude)
     codex = "b71e04d2"
@@ -137,6 +134,12 @@ try:
         page = ctx.new_page()
         page.goto(login)
         page.wait_for_url(base + "/#all")
+        page.wait_for_selector(".trow")
+        # Аня пишет поручение ИИ прямо в карточке — со страницы, под своим входом
+        r = ctx.request.patch(base + "/api/task/W-1", headers={"X-Pult": "1"}, data={
+            "prompt": "Токен бота — в чате клиники. Проверь, что заявки доходят, и напиши в журнал, если что-то не так."})
+        assert r.ok, r.text()
+        page.reload()
         page.wait_for_selector(".trow")
         page.goto(base + "/#board")
         page.wait_for_selector(".bcol")
