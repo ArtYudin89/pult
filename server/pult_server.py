@@ -76,7 +76,7 @@ COOKIE = "pult_s"
 SESSION_TOUCH_SEC = 600
 SESSION_TTL_DAYS = 180
 INVITE_DAYS = 7
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 # Сессии ИИ по карточкам: заявку («Выполнить» на странице) забирает исполнитель на компьютере человека
 # (pult_runner.py с ключом модели) и отчитывается сюда. asked — сессия закончила ход вопросом человеку,
 # blocked — сессия жива и ждёт разрешения на том компьютере.
@@ -106,7 +106,7 @@ MONTH_RU = ("января", "февраля", "марта", "апреля", "м�
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
-INSERT OR IGNORE INTO meta(k, v) VALUES ('schema', '5'), ('rev', '0');
+INSERT OR IGNORE INTO meta(k, v) VALUES ('schema', '6'), ('rev', '0');
 CREATE TABLE IF NOT EXISTS actors(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, color TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '', sort INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS tasks(
   title TEXT NOT NULL, status TEXT NOT NULL, holder TEXT REFERENCES actors(id),
   next_step TEXT NOT NULL DEFAULT '', wait_for TEXT NOT NULL DEFAULT '',
   check_on TEXT, due_on TEXT, done_on TEXT, notes TEXT NOT NULL DEFAULT '',
-  mem TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL DEFAULT '',
+  mem TEXT NOT NULL DEFAULT '', checklist TEXT NOT NULL DEFAULT '[]', prompt TEXT NOT NULL DEFAULT '',
   ai_model TEXT NOT NULL DEFAULT '', ai_effort TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL,
   version INTEGER NOT NULL DEFAULT 1);
@@ -184,6 +184,7 @@ TASK_FIELDS = {
     "done_on": ("done_on", "date", "Закрыта"),
     "notes": ("notes", "notes", "Описание"),
     "mem": ("mem", "text", "Подробности"),
+    "checklist": ("checklist", "checklist", "Шаги"),
     "prompt": ("prompt", "prompt", "Сообщение для ИИ"),
     "model": ("ai_model", "ai", "Модель ИИ"),
     "effort": ("ai_effort", "ai", "Усилие ИИ"),
@@ -348,6 +349,21 @@ def v_date(value, field):
         raise ApiError(400, f"{field}: дата в виде ГГГГ-ММ-ДД") from None
 
 
+def v_checklist(value):
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 100:
+        raise ApiError(400, "шаги: нужен список до 100 пунктов")
+    out = []
+    for item in value:
+        if isinstance(item, str):
+            item = {"t": item, "on": False}
+        if not isinstance(item, dict):
+            raise ApiError(400, "шаги: каждый пункт — {t, on}")
+        out.append({"t": v_text(item.get("t"), "шаг", 300, required=True), "on": bool(item.get("on"))})
+    return out
+
+
 def v_ai(value, field):
     """Модель или усилие ИИ; пусто — взять с уровня выше."""
     value = v_text(value, field, 60)
@@ -385,6 +401,26 @@ def v_id(value, field):
     return value
 
 
+# ---------- журнал: человеческие описания изменений ----------
+
+def checklist_changes(old, new):
+    out, pool = [], {}
+    for item in old:
+        pool.setdefault(item["t"], []).append(item["on"])
+    for item in new:
+        if pool.get(item["t"]):
+            was = pool[item["t"]].pop(0)
+            if was != item["on"]:
+                out.append(f"Шаг «{short(item['t'], 70)}» — {'выполнен' if item['on'] else 'снова открыт'}")
+        else:
+            out.append(f"Добавлен шаг «{short(item['t'], 70)}»" + (" (выполнен)" if item["on"] else ""))
+    for text, rest in pool.items():
+        out.extend(f"Убран шаг «{short(text, 70)}»" for _ in rest)
+    if not out and [i["t"] for i in old] != [i["t"] for i in new]:
+        out.append("Шаги переставлены")
+    return out
+
+
 def prompt_change(value):
     # Сообщение для ИИ — поручение человека: в журнал целиком, чтобы после очистки поля осталось, что просили.
     return f"Сообщение для ИИ: «{value}»" if value else "Сообщение для ИИ: убрано"
@@ -394,9 +430,23 @@ def ai_change(label, value):
     return f"{label}: {value}" if value else f"{label}: как у проекта"
 
 
-def steps_text(items):
-    """Пункты убранного поля «Шаги» строками для описания: отмеченные — с галочкой."""
-    return "\n".join(("☑ " if i.get("on") else "☐ ") + str(i.get("t", "")).strip() for i in items)
+# Схема 4 убирала «Шаги» в конец описания под первым заголовком, pult.py import того времени — под вторым.
+STEPS_HEADS = ("Шаги (раньше были отдельным полем):", "Шаги:")
+
+
+def steps_from_notes(notes):
+    """Шаги, которые схема 4 и pult.py import дописали в конец описания: заголовок из STEPS_HEADS и под ним
+    до конца описания только строки «☐ …» и «☑ …». Возвращает (описание без них, шаги) или None."""
+    lines = notes.rstrip().split("\n")
+    i = len(lines)
+    while i and lines[i - 1].startswith(("☐ ", "☑ ")):
+        i -= 1
+    if i == len(lines) or not i or lines[i - 1].strip() not in STEPS_HEADS:
+        return None
+    items = [{"t": s[2:].strip(), "on": s[0] == "☑"} for s in lines[i:] if s[2:].strip()]
+    if len(items) > 100 or any(len(x["t"]) > 300 for x in items):
+        return None
+    return "\n".join(lines[:i - 1]).rstrip(), items
 
 
 class DB:
@@ -434,19 +484,25 @@ class DB:
                     for col in cols:
                         if col not in have:
                             c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
-                # Поля «Шаги» больше нет: пункты дописываются в конец описания. Столбец остаётся пустым,
-                # чтобы с этой базой работала и прежняя версия сервера, если придётся откатиться.
-                if "checklist" in {r["name"] for r in c.execute("PRAGMA table_info(tasks)")}:
-                    rows = c.execute("SELECT id, notes, checklist FROM tasks "
-                                     "WHERE checklist NOT IN ('', '[]')").fetchall()
-                    for r in rows:
-                        notes = (r["notes"] + "\n\n" if r["notes"] else "") + \
-                            "Шаги (раньше были отдельным полем):\n" + steps_text(json.loads(r["checklist"]))
-                        c.execute("UPDATE tasks SET notes = ?, checklist = '[]', version = version + 1 WHERE id = ?",
-                                  (notes, r["id"]))
-                    if rows:
-                        self.bump(c)
+                # Схема 4 ещё и переносила «Шаги» в описание. Со схемы 6 они снова отдельным полем, так что
+                # в базе до схемы 4 шаги остаются на месте.
             # Схема 5 добавила только таблицы сессий ИИ (runs, tg_notes): их заводит SCHEMA.
+            if ver < 6:
+                # «Шаги» вернулись: столбец есть в базе, начатой до схемы 4, а пункты, которые схема 4
+                # дописала в конец описания, уходят обратно в шаги. Версия +1 — правка по старой версии
+                # описания упрётся в 409, а не затрёт перенос.
+                if "checklist" not in {r["name"] for r in c.execute("PRAGMA table_info(tasks)")}:
+                    c.execute("ALTER TABLE tasks ADD COLUMN checklist TEXT NOT NULL DEFAULT '[]'")
+                moved = 0
+                for r in c.execute("SELECT id, notes FROM tasks WHERE checklist IN ('', '[]') AND notes != ''"
+                                   ).fetchall():
+                    got = steps_from_notes(r["notes"])
+                    if got and got[1]:
+                        c.execute("UPDATE tasks SET notes = ?, checklist = ?, version = version + 1 WHERE id = ?",
+                                  (got[0], json.dumps(got[1], ensure_ascii=False), r["id"]))
+                        moved += 1
+                if moved:
+                    self.bump(c)
             c.execute("UPDATE meta SET v = ? WHERE k = 'schema'", (str(SCHEMA_VERSION),))
 
     @contextlib.contextmanager
@@ -619,7 +675,8 @@ class DB:
     def task_dict(r, full=False, files=0):
         d = {"key": r["key"], "project": r["project_id"], "title": r["title"], "status": r["status"],
              "holder": r["holder"], "next": r["next_step"], "wait": r["wait_for"], "check": r["check_on"],
-             "due": r["due_on"], "done_on": r["done_on"], "mem": r["mem"], "prompt": r["prompt"],
+             "due": r["due_on"], "done_on": r["done_on"], "mem": r["mem"],
+             "checklist": json.loads(r["checklist"]), "prompt": r["prompt"],
              "model": r["ai_model"], "effort": r["ai_effort"], "created_at": r["created_at"],
              "created_by": r["created_by"], "updated_at": r["updated_at"], "updated_by": r["updated_by"],
              "version": r["version"], "has_notes": bool(r["notes"]), "files": files}
@@ -776,8 +833,6 @@ class DB:
         return r["name"] if r else pid
 
     def _clean_task(self, c, body, creating):
-        if "checklist" in body:
-            raise ApiError(400, "поля «Шаги» больше нет: план пишите в описание (notes)")
         out = {}
         for name, (col, kind, label) in TASK_FIELDS.items():
             if name not in body:
@@ -806,6 +861,8 @@ class DB:
                 value = v_text(value, label, 4000)
             elif kind == "date":
                 value = v_date(value, label)
+            elif kind == "checklist":
+                value = v_checklist(value)
             elif kind == "ai":
                 value = v_ai(value, label)
             out[col] = value
@@ -857,7 +914,8 @@ class DB:
         cols = {"key": key, "project_id": f["project_id"], "title": f["title"], "status": f["status"],
                 "holder": f.get("holder"), "next_step": f.get("next_step", ""), "wait_for": f.get("wait_for", ""),
                 "check_on": f.get("check_on"), "due_on": f.get("due_on"), "done_on": f.get("done_on"),
-                "notes": f.get("notes", ""), "mem": f.get("mem", ""), "prompt": f.get("prompt", ""),
+                "notes": f.get("notes", ""), "mem": f.get("mem", ""),
+                "checklist": json.dumps(f.get("checklist", []), ensure_ascii=False), "prompt": f.get("prompt", ""),
                 "ai_model": f.get("ai_model", ""), "ai_effort": f.get("ai_effort", ""),
                 "created_at": created_at, "created_by": actor["id"], "updated_at": stamp,
                 "updated_by": actor["id"], "version": 1}
@@ -949,10 +1007,11 @@ class DB:
         for name, (col, kind, label) in TASK_FIELDS.items():
             if col not in new:
                 continue
-            old, value = row[col], new[col]
+            old = json.loads(row[col]) if kind == "checklist" else row[col]
+            value = new[col]
             if old == value or (kind in ("text", "notes", "prompt", "ai") and (old or "") == (value or "")):
                 continue
-            sets[col] = value
+            sets[col] = json.dumps(value, ensure_ascii=False) if kind == "checklist" else value
             fields.add(name)
             if kind == "status":
                 changes.append(f"Статус: {STATUS_RU[old]} → {STATUS_RU[value]}")
@@ -971,6 +1030,8 @@ class DB:
             elif kind == "notes":
                 changes.append("Описание добавлено" if not old else "Описание убрано" if not value
                                else "Описание изменено")
+            elif kind == "checklist":
+                changes.extend(checklist_changes(old, value))
             elif kind == "prompt":
                 changes.append(prompt_change(value))
             elif kind == "ai":
@@ -2861,8 +2922,8 @@ def init_cmd(args):
         "project": "pult", "title": "Подключить ИИ к Пульту", "status": "next", "holder": aid or pid,
         "next": "вписать в инструкции ИИ блок из docs/for-ai.md",
         "notes": "ИИ читает сводку в начале сессии (pult.py brief) и сам двигает карточки в конце (pult.py apply). "
-                 "Эта карточка — первая: закройте её, когда ИИ впервые подвинет карточки сам.\n\nПо шагам:\n" +
-                 "\n".join(f"{i}. {s}" for i, s in enumerate(WELCOME_STEPS, 1)),
+                 "Эта карточка — первая: закройте её, когда ИИ впервые подвинет карточки сам.",
+        "checklist": WELCOME_STEPS,
         "prompt": "Заведи в Пульте мои проекты и задачи: спроси, над чем я сейчас работаю, и разложи по проектам.",
         "comment": "Пульт создан"})
     invite = db.create_invite(me, pid, {"days": 7, "note": "первый вход"})

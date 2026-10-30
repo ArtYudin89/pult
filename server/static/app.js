@@ -72,8 +72,10 @@
   const ICON_PEOPLE = '<svg class="vi" viewBox="0 0 16 16" aria-hidden="true"><circle cx="6" cy="5.5" r="2.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M1.8 13.5c.5-2.2 2.1-3.4 4.2-3.4s3.7 1.2 4.2 3.4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="11.4" cy="6.3" r="1.8" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M11.1 10.2c1.6 0 2.8.9 3.2 2.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
   const ICON_BOARD = '<svg class="vi" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.8" y="2.3" width="3.6" height="11.4" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="6.2" y="2.3" width="3.6" height="7.6" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="10.6" y="2.3" width="3.6" height="9.4" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>';
   const CLIP = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M10.6 5.4l-4.7 4.7a1.4 1.4 0 0 0 2 2l5-5a2.8 2.8 0 0 0-4-4l-5 5a4.2 4.2 0 0 0 6 6l4-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const STEPS = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.3" y="2.3" width="11.4" height="11.4" rx="2.6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.2 8.2l1.9 1.9 3.7-4.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   const MSG = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1.2 1.2 0 0 1 1.2 1.2v5.6A1.2 1.2 0 0 1 13 11H7.4L4.2 13.6V11H3a1.2 1.2 0 0 1-1.2-1.2V4.2A1.2 1.2 0 0 1 3 3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
   const FILEICON = '<svg class="fico" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 1.8h5l3.2 3.2v9.2H4z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M9 1.8V5h3.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
+  const CHECK = '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6.2l2.3 2.3 4.7-5" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   const XICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 3.5l9 9M12.5 3.5l-9 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
 
   const QUICK = [
@@ -390,6 +392,7 @@
     const p = PROJ[t.project], a = AREA_OF[t.project], st = stepText(t);
     const where = (a ? a.name + " › " : "") + (p ? p.name : t.project);
     const extra = (t.run && runLive(t.run.status) ? " · сессия ИИ: " + RUN_RU[t.run.status] : t.prompt ? " · сообщение для ИИ" : "") +
+      (t.checklist && t.checklist.length ? " · шаги " + t.checklist.filter(c => c.on).length + "/" + t.checklist.length : "") +
       (t.files ? " · " + t.files + " " + plural(t.files, "вложение", "вложения", "вложений") : "");
     return '<button class="trow' + (t.key === openKey ? " on" : "") + '" type="button" data-task="' + esc(t.key) + '"><span class="tid">' + hl(t.key, ts) + '</span>' +
       '<span class="tt"><span class="t">' + hl(t.title, ts) + '</span><span class="meta">' + hl(where + (st ? " · " + st : ""), ts) + esc(extra) + '</span></span>' +
@@ -482,12 +485,13 @@
     const p = PROJ[t.project];
     const ask = t.run && runLive(t.run.status) ? '<span class="runmark run-' + t.run.status + '" title="Сессия ИИ: ' + RUN_RU[t.run.status] + '">' + (t.run.status === "asked" ? "? ИИ ждёт" : t.run.status === "queued" ? "ИИ в очереди" : "▶ ИИ") + '</span>'
       : t.prompt ? '<span title="Сообщение для ИИ">' + MSG + 'ИИ</span>' : "";
+    const steps = t.checklist && t.checklist.length ? '<span title="Шаги">' + STEPS + t.checklist.filter(c => c.on).length + "/" + t.checklist.length + '</span>' : "";
     const files = t.files ? '<span title="Вложения">' + CLIP + t.files + '</span>' : "";
     return '<button class="bcard' + (isLate(t) ? " late" : "") + (isOpen(t) ? "" : " closed") + (t.key === openKey ? " on" : "") + '" type="button" data-task="' + esc(t.key) + '"' + (canEdit(t.project) ? " data-drag" : "") + '>' +
       '<span class="bc-top"><span class="tid">' + hl(t.key, ts) + '</span>' + dateChip(t) + '</span>' +
       '<span class="bc-t">' + hl(t.title, ts) + '</span>' +
       (oneProject ? "" : '<span class="bc-p">' + hl((AREA_OF[t.project] ? AREA_OF[t.project].name + " › " : "") + (p ? p.name : t.project), ts) + '</span>') +
-      '<span class="bc-foot">' + ask + files + av(t.holder) + '</span></button>';
+      '<span class="bc-foot">' + ask + steps + files + av(t.holder) + '</span></button>';
   }
 
   function renderBoard() {
@@ -1123,10 +1127,21 @@
       : '<div class="actions"><button class="btn" type="button" data-copy>Ссылка</button><span class="muted">Только чтение: права править задачи этого проекта у вас нет.</span></div>';
     const ask = t.prompt ? '<section class="ask"><h3 class="subhead">' + MSG + 'Сообщение для ИИ' + (can ? '<button class="linkbtn" type="button" data-askclear>убрать</button>' : "") + '</h3><p class="notes">' + linkify(t.prompt) + '</p></section>' : "";
     const notes = t.notes ? '<section><h3 class="subhead">Описание</h3><p class="notes">' + linkify(t.notes) + '</p></section>' : "";
+    const done = t.checklist.filter(c => c.on).length;
+    const box = c => '<span class="box' + (c.on ? " on" : "") + '">' + (c.on ? CHECK : "") + '</span><span class="ct">' + esc(c.t) + '</span>';
+    const steps = '<section><h3 class="subhead">Шаги' + (t.checklist.length ? " · " + done + " из " + t.checklist.length : "") + '</h3>' +
+      (t.checklist.length ? '<ul class="checklist">' + t.checklist.map((c, i) => '<li>' + (can
+        ? '<button class="cbtn' + (c.on ? " on" : "") + '" type="button" data-step="' + i + '" aria-pressed="' + c.on + '">' + box(c) + '</button>'
+        : '<span class="cbtn ro' + (c.on ? " on" : "") + '">' + box(c) + '</span>') + '</li>').join("") + '</ul>' : (can ? "" : '<p class="muted">Шагов нет.</p>')) +
+      (can ? '<form class="addstep" data-form="addstep"><input class="inp" name="t" maxlength="300" placeholder="Новый шаг" autocomplete="off" aria-label="Новый шаг"><button class="btn small" type="submit">Добавить</button></form>' : "") + '</section>';
     const comment = can ? '<form class="comment" data-form="comment"><textarea class="ta short" name="text" maxlength="4000" placeholder="Запись в журнал: что сделано, что решили" aria-label="Запись в журнал"></textarea><div><button class="btn small" type="submit">Записать в журнал</button></div></form>' : "";
     const jr = card.journal.length ? '<ol class="journal">' + card.journal.map(e => '<li>' + av(e.actor) + '<div>' + jentry(e, false) + '</div></li>').join("") + '</ol>' : '<p class="muted">Записей пока нет.</p>';
     return drawerHead(t.key) + '<div class="task"><div class="task-top"><div class="crumbs">' + (a ? esc(a.name) + ' › ' : "") + esc(p ? p.name : t.project) + '</div><h2>' + esc(t.title) + '</h2></div>' +
-      f + acts + runsHTML(t, can) + ask + notes + filesHTML(can) + '<section><h3 class="subhead">Журнал</h3>' + comment + '</section>' + jr + '</div>';
+      f + acts + runsHTML(t, can) + ask + notes + steps + filesHTML(can) + '<section><h3 class="subhead">Журнал</h3>' + comment + '</section>' + jr + '</div>';
+  }
+
+  function stepRow(c) {
+    return '<li><input type="checkbox" name="s_on"' + (c && c.on ? " checked" : "") + ' aria-label="выполнен"><input class="inp" name="s_t" maxlength="300" value="' + esc(c ? c.t : "") + '" aria-label="шаг" autocomplete="off"><button class="iconbtn" type="button" data-rmrow aria-label="Убрать шаг">' + XICON + '</button></li>';
   }
 
   function formHTML(t, isNew) {
@@ -1149,6 +1164,7 @@
       '<div class="row2"><label class="f"><span>Ждём</span><input class="inp" name="wait" maxlength="500" value="' + esc(t.wait || "") + '" placeholder="кого или чего" autocomplete="off"></label>' +
       '<label class="f"><span>Проверить</span><input class="inp" type="date" name="check" value="' + esc(t.check || "") + '"></label></div>' +
       '<label class="f"><span>Описание</span><textarea class="ta" name="notes" maxlength="20000" rows="6">' + esc(t.notes || "") + '</textarea></label>' +
+      '<div class="f"><span>Шаги</span><ul class="steps-edit">' + (t.checklist || []).map(stepRow).join("") + '</ul><div><button class="btn small" type="button" data-addrow>+ шаг</button></div></div>' +
       '<label class="f"><span>Подробности</span><input class="inp mono" name="mem" maxlength="500" value="' + esc(t.mem || "") + '" placeholder="файл памяти или папка" autocomplete="off"></label>' +
       '<label class="f"><span>Запись в журнал</span><input class="inp" name="comment" maxlength="4000" placeholder="необязательно: почему меняем" autocomplete="off"></label>' +
       '<div class="formbar"><button class="btn primary" type="submit">' + (isNew ? "Создать" : "Сохранить") + '</button><button class="btn" type="button" data-cancel>Отмена</button><span class="spacer"></span>' +
@@ -1157,10 +1173,12 @@
 
   function readForm(form) {
     const v = n => form.elements[n] ? form.elements[n].value : "";
+    const ons = [...form.querySelectorAll('input[name="s_on"]')], txts = [...form.querySelectorAll('input[name="s_t"]')];
     return {
       title: v("title").trim(), project: v("project"), status: v("status"), holder: v("holder") || null,
       due: v("due") || null, next: v("next").trim(), wait: v("wait").trim(), check: v("check") || null,
-      notes: v("notes").trim(), mem: v("mem").trim(), comment: v("comment").trim()
+      notes: v("notes").trim(), mem: v("mem").trim(), comment: v("comment").trim(),
+      checklist: txts.map((x, i) => ({t: x.value.trim(), on: ons[i].checked})).filter(c => c.t)
     };
   }
 
@@ -1191,6 +1209,7 @@
     if (!f.title) { toast("Нужно название", true); form.elements.title.focus(); return; }
     const same = (x, y) => (x == null ? "" : x) === (y == null ? "" : y);
     ["title", "project", "status", "holder", "due", "next", "wait", "check", "notes", "mem"].forEach(k => { if (!same(f[k], t[k])) body[k] = f[k]; });
+    if (JSON.stringify(f.checklist) !== JSON.stringify(t.checklist)) body.checklist = f.checklist;
     if (f.comment) body.comment = f.comment;
     if (!Object.keys(body).length) { mode = "view"; renderCard(); return; }
     await busy(form, patchTask(body, "Сохранено"));
@@ -1240,7 +1259,7 @@
       const ok = id => PROJ[id] && canEdit(id);
       const r = route.view === "board" ? (splitScope(route.id) || {view: "all"}) : route;
       const pid0 = r.view === "p" && ok(r.id) ? r.id : r.view === "a" && AREA[r.id] ? ((visibleProjects(AREA[r.id]).find(p => canEdit(p.id)) || {}).id || "") : "";
-      newDefaults = {project: pid0, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: ""};
+      newDefaults = {project: pid0, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: "", checklist: []};
     }
     openKey = null; card = null; mode = "new"; ++cardSeq;
     pid = null; pcard = null; secret = null;
@@ -1252,7 +1271,7 @@
 
   function newTask(projectId) {
     newDefaults = null;
-    if (projectId && PROJ[projectId]) newDefaults = {project: projectId, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: ""};
+    if (projectId && PROJ[projectId]) newDefaults = {project: projectId, title: "", status: "inbox", holder: null, next: "", wait: "", check: null, due: null, notes: "", mem: "", checklist: []};
     location.hash = hashFor(route, "new");
   }
 
@@ -1329,7 +1348,7 @@
 
   // ---------- события ----------
 
-  const CLICKS = "[data-nav],[data-task],[data-close],[data-reset],[data-more-closed],[data-status],[data-take],[data-pass],[data-holder],[data-edit],[data-cancel],[data-copy],[data-del],[data-rmrow],[data-aiedit],[data-aicancel],[data-run],[data-askonly],[data-askclear],[data-runstop],[data-tglink],[data-tgunlink],[data-logactor],[data-new],[data-me],[data-logout]," +
+  const CLICKS = "[data-nav],[data-task],[data-close],[data-reset],[data-more-closed],[data-status],[data-take],[data-pass],[data-holder],[data-edit],[data-cancel],[data-step],[data-copy],[data-del],[data-addrow],[data-rmrow],[data-aiedit],[data-aicancel],[data-run],[data-askonly],[data-askclear],[data-runstop],[data-tglink],[data-tgunlink],[data-logactor],[data-new],[data-me],[data-logout]," +
     "[data-person],[data-pnew],[data-ungrant],[data-role],[data-revoke-key],[data-revoke-invite],[data-copy-secret],[data-pedit],[data-active],[data-addgrant],[data-board],[data-attach],[data-fdel]";
 
   document.addEventListener("click", ev => {
@@ -1389,6 +1408,11 @@
     } else if (d.cancel !== undefined) {
       if (pid !== null) { if (pmode === "new") closeTask(); else { pmode = "view"; renderPerson(); } }
       else if (mode === "new") closeTask(); else { mode = "view"; renderCard(); }
+    } else if (d.step !== undefined && card) {
+      const list = card.task.checklist.map(c => Object.assign({}, c)), i = Number(d.step);
+      if (!list[i]) return;
+      list[i].on = !list[i].on;
+      patchTask({checklist: list});
     } else if (d.aiedit !== undefined) {
       aiEdit = d.aiedit; renderMain();
       const m = $("main").querySelector('form[data-form="ai"] input[name="model"]');
@@ -1431,6 +1455,10 @@
         closeTask();
         renderSide(); renderMain();
       }, e => toast(e.message, true));
+    } else if (d.addrow !== undefined) {
+      const ul = el.closest(".f").querySelector(".steps-edit");
+      ul.insertAdjacentHTML("beforeend", stepRow(null));
+      ul.lastElementChild.querySelector('input[name="s_t"]').focus();
     } else if (d.addgrant !== undefined) {
       el.closest(".f").querySelector(".grants-edit").insertAdjacentHTML("beforeend", grantRow());
     } else if (d.rmrow !== undefined) {
@@ -1482,6 +1510,10 @@
       busy(form, api("POST", "/api/task/" + encodeURIComponent(card.task.key) + "/comment", {text})
         .then(r => { card.task = r.task; applyTask(r.task); return reloadCard(); })
         .then(() => toast("Записано в журнал"), e => toast(e.message, true)));
+    } else if (kind === "addstep" && card) {
+      const text = form.elements.t.value.trim();
+      if (!text) return;
+      busy(form, patchTask({checklist: card.task.checklist.concat([{t: text, on: false}])}, "Шаг добавлен"));
     } else if (kind === "run" && card) saveRun(form, false);
     else if (kind === "runreply" && card) {
       const text = form.elements.message.value.trim();

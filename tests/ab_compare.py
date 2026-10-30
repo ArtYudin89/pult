@@ -27,14 +27,20 @@ import urllib.request
 prod, old_srv, new_srv, static, cli_dir = sys.argv[1:6]
 sys.path.insert(0, cli_dir)
 import pult as cli  # noqa: E402
+import importlib.util  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location("pult_server_new", new_srv)
+NEW = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(NEW)
 
 # этап 3: в /api/state — limits, у задачи — число вложений, у карточки — их список.
 # Схема 4: у задачи — сообщение для ИИ, модель и усилие, у карточки — ещё ai (что получилось по уровням),
-# у проекта и раздела — модель и усилие, в /api/state — ai всего Пульта. Поля «Шаги» нет: при переходе его
-# пункты дописаны в конец описания, версия карточки и rev выросли на 1 — as_after_move() делает то же
-# со старым ответом, а остальное должно совпасть.
+# у проекта и раздела — модель и усилие, в /api/state — ai всего Пульта.
 # Схема 5: сессии ИИ — в /api/state исполнители (runners) и у задачи последняя сессия (run), у карточки —
 # список сессий (runs); в ai — ещё пределы запуска.
+# Схема 6: «Шаги» снова отдельным полем (checklist у задачи). Пункты, которые схема 4 дописала в конец
+# описания, переход забирает обратно, версия карточки и rev растут на 1 — as_after_move() делает то же со
+# старым ответом (старый сервер — схема 5), а остальное, шаги в том числе, должно совпасть.
 NEW_TOP = {"limits", "ai", "runners"}
 NEW_ACTOR = set()
 NEW_AREA = {"model", "effort"}
@@ -43,7 +49,7 @@ NEW_JOURNAL = set()
 NEW_TASK = {"files", "prompt", "model", "effort", "run"}
 NEW_CARD = {"files", "runs"}
 NEW_CARD_TASK = {"ai"}
-GONE_TASK = {"checklist"}
+GONE_TASK = set()
 
 
 def pick_actor(db_path, prefer):
@@ -95,21 +101,29 @@ def strip(obj, kind):
     return obj
 
 
-def as_after_move(obj, kind):
-    """Старый ответ таким, каким его должен сделать переход на схему 4: «Шаги» — в конце описания, версия +1."""
+def as_after_move(obj, kind, moved):
+    """Старый ответ таким, каким его должен сделать переход на схему 6: шаги из конца описания — снова полем,
+    версия +1. moved — {номер: (описание без шагов, шаги)} по старым карточкам."""
     def fix(t, full):
-        items = t.get("checklist") or []
-        if not items:
-            return t
-        t = dict(t, version=t["version"] + 1, has_notes=True)
+        if t["key"] not in moved:
+            return dict(t, checklist=t.get("checklist", []))
+        notes, items = moved[t["key"]]
+        t = dict(t, version=t["version"] + 1, has_notes=bool(notes), checklist=items)
         if full:
-            t["notes"] = (t["notes"] + "\n\n" if t["notes"] else "") + "Шаги (раньше были отдельным полем):\n" + \
-                "\n".join(("☑ " if i["on"] else "☐ ") + i["t"].strip() for i in items)
+            t["notes"] = notes
         return t
     if kind == "state":
-        moved = any(t.get("checklist") for t in obj["tasks"])
-        return dict(obj, tasks=[fix(t, False) for t in obj["tasks"]], rev=obj["rev"] + moved)
+        return dict(obj, tasks=[fix(t, False) for t in obj["tasks"]], rev=obj["rev"] + bool(moved))
     return dict(obj, task=fix(obj["task"], True))
+
+
+def steps_moved(card):
+    """Что переход на схему 6 сделает с карточкой старого сервера: (описание, шаги) или None."""
+    t = card["task"]
+    if t.get("checklist") or not t.get("notes"):
+        return None
+    got = NEW.steps_from_notes(t["notes"])
+    return got if got and got[1] else None
 
 
 def cli_out(port, *argv):
@@ -151,9 +165,11 @@ try:
     print("state: roles after migration:", [(a["id"], a["role"], a["owner"]) for a in st["new"]["actors"]])
     print("state: access entries:", len(st["new"]["access"]), "projects:", len(st["new"]["projects"]),
           "writers of eltan:", next(p["writers"] for p in st["new"]["projects"] if p["id"] == "eltan"))
-    moved = [t["key"] for t in st["old"]["tasks"] if t.get("checklist")]
-    print(f"state: cards with steps moved into notes: {len(moved)}")
-    a, b = strip(as_after_move(st["old"], "state"), "state"), strip(st["new"], "state")
+    cards = {t["key"]: get(ports["old"], f"/api/task/{urllib.request.quote(t['key'])}?journal=1000")
+             for t in st["old"]["tasks"]}
+    moved = {k: got for k, c in cards.items() for got in [steps_moved(c)] if got}
+    print(f"state: cards with steps moved back from notes: {len(moved)}")
+    a, b = strip(as_after_move(st["old"], "state", moved), "state"), strip(st["new"], "state")
     if a != b:
         diffs += 1
         for k in a:
@@ -164,9 +180,9 @@ try:
             len(a["tasks"]), len(a["projects"]), len(a["areas"]), len(a["actors"])))
     bad = []
     for t in st["old"]["tasks"]:
-        o = get(ports["old"], f"/api/task/{urllib.request.quote(t['key'])}?journal=1000")
+        o = cards[t["key"]]
         n = get(ports["new"], f"/api/task/{urllib.request.quote(t['key'])}?journal=1000")
-        if strip(as_after_move(o, "card"), "card") != strip(n, "card"):
+        if strip(as_after_move(o, "card", moved), "card") != strip(n, "card"):
             bad.append(t["key"])
     print(f"cards: {len(st['old']['tasks'])} compared, differ: {bad or 'none'}")
     diffs += bool(bad)

@@ -18,7 +18,7 @@ https://github.com/ArtYudin89/pult — pult.py, docs/for-ai.md.
                                      ai — модель, усилие ИИ и пределы запуска для всего Пульта;
                                      run у задачи — её последняя сессия ИИ {id, status}; runners —
                                      исполнители моих моделей: online, seen, week (% недели), week_resets
-  GET   /api/task/<номер>            карточка: описание, журнал, files — список вложений
+  GET   /api/task/<номер>            карточка: описание, шаги, журнал, files — список вложений
                                      [{id, name, size, image, created_at, created_by}, …];
                                      task.ai — с какой моделью и усилием запускать сессию по карточке
                                      и откуда они взяты: {model, model_from, effort, effort_from},
@@ -30,7 +30,7 @@ https://github.com/ArtYudin89/pult — pult.py, docs/for-ai.md.
 
 Запись (нужен доступ edit к проекту задачи)
   POST  /api/task                    {project, title, status?, holder?, next?, wait?, check?, due?,
-                                      notes?, prompt?, model?, effort?, comment?}
+                                      notes?, checklist?, prompt?, model?, effort?, comment?}
   PATCH /api/task/<номер>            {поля…, version, comment?} — меняются только названные поля
   POST  /api/task/<номер>/comment    {text} — запись в журнал
   POST  /api/task/<номер>/files      вложение: тело запроса — сам файл (любой Content-Type), имя — в
@@ -51,7 +51,8 @@ https://github.com/ArtYudin89/pult — pult.py, docs/for-ai.md.
   closed — закрытый раздел или проект: доступ «ко всем проектам» и к разделу его не открывает.
 
 Поля: status — inbox, next, doing, wait, done, dropped; даты (check, due) — ГГГГ-ММ-ДД или null;
-holder — id участника или null; prompt — сообщение для ИИ: поручение человека, которое ИИ читает
+holder — id участника или null; checklist — шаги карточки [{"t": "шаг", "on": false}, …], до 100
+пунктов, передаётся целиком; prompt — сообщение для ИИ: поручение человека, которое ИИ читает
 первым (взяв в работу, очистите поле: ""). model и effort — модель и усилие для сессии по карточке,
 как их понимает программа агента (claude-opus-5-5, high); пусто — взять с уровня выше: карточка →
 проект → раздел → весь Пульт.

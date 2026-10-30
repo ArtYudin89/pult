@@ -299,6 +299,39 @@ try:
         page.wait_for_selector(".bcol")
         check("ИИ" in page.locator('.bcard[data-task="INF-30"] .bc-foot').inner_text(), "на доске: значок сообщения для ИИ")
 
+        # ---------- шаги: вернулись из описания (схема 6), флажки нажимаются ----------
+        page.goto(base + f"/#p={proj}&t=INF-30")
+        page.wait_for_selector("#drawer .checklist")
+        steps0 = task("INF-30")["checklist"]
+        check(len(steps0) >= 1 and "Шаги (раньше были отдельным полем)" not in (task("INF-30")["notes"] or ""),
+              f"шаги снова отдельным полем, в описании их нет ({len(steps0)})")
+        head = page.locator("#drawer h3", has_text="Шаги").text_content()  # inner_text — заглавными, как на экране
+        check(f"{sum(c['on'] for c in steps0)} из {len(steps0)}" in head, f"заголовок блока: {head!r}")
+        page.click('#drawer [data-step="0"]')
+        page.wait_for_selector('#drawer [data-step="0"][aria-pressed="' + str(not steps0[0]["on"]).lower() + '"]')
+        check(task("INF-30")["checklist"][0]["on"] is not steps0[0]["on"], "щелчок по флажку меняет шаг на сервере")
+        check(f"Шаг «{steps0[0]['t'][:20]}" in page.locator("#drawer .journal").inner_text(), "журнал: шаг отмечен")
+        page.fill('#drawer form[data-form="addstep"] input[name="t"]', "проверить на телефоне")
+        page.click('#drawer form[data-form="addstep"] button[type="submit"]')
+        page.wait_for_selector('#drawer [data-step="' + str(len(steps0)) + '"]')
+        check(task("INF-30")["checklist"][-1] == {"t": "проверить на телефоне", "on": False}, "«Новый шаг» добавлен в конец")
+        page.click("#drawer [data-edit]")
+        page.wait_for_selector('#drawer form[data-form="edit"] .steps-edit')
+        check(page.locator("#drawer .steps-edit li").count() == len(steps0) + 1, "в «Изменить» — шаги списком")
+        page.click("#drawer [data-addrow]")
+        page.fill('#drawer .steps-edit li:last-child input[name="s_t"]', "из формы")
+        page.check('#drawer .steps-edit li:last-child input[name="s_on"]')
+        page.click('#drawer form[data-form="edit"] button[type="submit"]')
+        page.wait_for_selector("#drawer .checklist")
+        steps1 = task("INF-30")["checklist"]
+        check(steps1[-1] == {"t": "из формы", "on": True} and len(steps1) == len(steps0) + 2, "шаг из формы сохранён")
+        page.locator("#drawer").screenshot(path=os.path.join(out, "12b_card_steps.png"))
+        frac = f"{sum(c['on'] for c in steps1)}/{len(steps1)}"
+        page.keyboard.press("Escape")
+        page.goto(base + "/#board")
+        page.wait_for_selector(".bcol")
+        check(frac in page.locator('.bcard[data-task="INF-30"] .bc-foot').inner_text(), f"на доске: шаги {frac}")
+
         # ---------- «Выполнить»: окно передачи в работу, блок сессии, отмена ----------
         page.goto(base + f"/#p={proj}&t=INF-30")
         page.wait_for_selector("#drawer [data-run]")
