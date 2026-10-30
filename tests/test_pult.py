@@ -1507,6 +1507,50 @@ class Runs(Base):
         self.assertTrue(t(plain, cj), "регистр букв в пути не важен")
         self.assertEqual(os.path.normcase(self.runner_mod.git_root(os.path.join(repo, "sub"))), os.path.normcase(repo))
 
+    def test_r8_trust_command(self):
+        """trust: «Yes, proceed» разом, как это записывает Claude Code; остальное в файле не меняется."""
+        r = self.runner_mod
+        cj = os.path.join(self.tmp, "trust8", "claude.json")
+        os.makedirs(os.path.dirname(cj))
+        lab, real = r.fwd(self.folder), r.fwd(os.path.realpath(self.folder))
+        raw = json.dumps({"numStartups": 3, "theme": "тёмная", "projects": {
+            lab: {"allowedTools": ["Bash(git:*)"], "hasTrustDialogAccepted": False, "lastCost": 0.5}}},
+            indent=2, ensure_ascii=False).encode("utf-8")
+        with open(cj, "wb") as f:
+            f.write(raw)
+
+        def run(answer):
+            out = io.StringIO()
+            with unittest.mock.patch("builtins.input", side_effect=answer), contextlib.redirect_stdout(out):
+                r.cmd_trust(self.rcfg, False, cj)
+            return out.getvalue()
+
+        self.assertIn(self.folder, run(EOFError))  # без терминала — как «нет»
+        with open(cj, "rb") as f:
+            self.assertEqual(f.read(), raw)
+        os.mkdir(cj + ".lock")  # Claude Code сейчас пишет файл
+        with unittest.mock.patch.object(r, "CONFIG_LOCK_SEC", 0.3), self.assertRaises(SystemExit):
+            run(["y"])
+        old = time.time() - 60
+        os.utime(cj + ".lock", (old, old))  # брошенная блокировка не мешает
+        self.assertIn("доверено папок", run(["y"]))
+        self.assertFalse(os.path.exists(cj + ".lock"))
+        self.assertIn("делать нечего", run(AssertionError))
+        with open(cj, "rb") as f:
+            text = f.read()
+        after = json.loads(text.decode("utf-8"))
+        self.assertEqual(text, json.dumps(after, indent=2, ensure_ascii=False).encode("utf-8"),
+                         "формат — как у Claude Code")
+        self.assertEqual(list(after["projects"][lab].items()),
+                         [("allowedTools", ["Bash(git:*)"]), ("hasTrustDialogAccepted", True), ("lastCost", 0.5)])
+        if real != lab:  # Windows: путь 8.3 — ключ и для настоящего пути на диске
+            self.assertEqual(after["projects"][real], {**r.NEW_PROJECT, "hasTrustDialogAccepted": True})
+        self.assertEqual({k: v for k, v in after.items() if k != "projects"}, {"numStartups": 3, "theme": "тёмная"})
+        bdir = os.path.join(os.path.dirname(cj), ".claude", "backups")
+        self.assertEqual(len(os.listdir(bdir)), 1)
+        with open(os.path.join(bdir, os.listdir(bdir)[0]), "rb") as f:
+            self.assertEqual(f.read(), raw, "копия — файл до правки")
+
     def test_r6_statusline_and_question_parsing(self):
         q = self.runner_mod.question_of
         self.assertEqual(q("Готово.\n**ВОПРОС:** какой цвет?"), "какой цвет?")

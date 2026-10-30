@@ -5,6 +5,7 @@
 
     pult_runner.py run                  работать: ждать заявки и запускать сессии (Ctrl+C — выход)
     pult_runner.py check                проверить адрес и ключ, программу claude и папки проектов
+    pult_runner.py trust [--yes]        доверить claude папки проектов разом — «Yes, proceed» за каждую
     pult_runner.py autostart on|off     Windows: запуск при входе в систему (ярлык в «Автозагрузке»)
     pult_runner.py statusline ФАЙЛ      служебная: строка состояния сессии сохраняет данные в ФАЙЛ
 
@@ -39,6 +40,7 @@ VERSION = "2026.10.27"
 LOCK_PORT = 47447            # второй исполнитель на этом же компьютере не стартует
 USAGE_FRESH_SEC = 6 * 3600   # расход недели старше этого для проверки потолка перед запуском не годится
 START_GRACE_SEC = 60         # столько ждём, пока новая сессия появится в claude agents
+CONFIG_LOCK_SEC = 10         # столько ждём, пока Claude Code допишет ~/.claude.json
 WATCH_SEC = float(os.environ.get("PULT_RUNNER_TICK") or 10)  # как часто смотреть на идущую сессию
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -183,6 +185,66 @@ def trusted(folder, claude_json=None):
         if (root and os.path.normcase(d) == os.path.normcase(root)) or up == d:
             return False
         d = up
+
+
+# Запись папки в ~/.claude.json, какой её создаёт Claude Code 2.1.308; «Yes, proceed» — она же с доверием
+NEW_PROJECT = {"allowedTools": [], "mcpContextUris": [], "mcpServers": {}, "enabledMcpjsonServers": [],
+               "disabledMcpjsonServers": [], "hasTrustDialogAccepted": False,
+               "hasClaudeMdExternalIncludesApproved": False, "hasClaudeMdExternalIncludesWarningShown": False}
+
+
+def write_private(path, data):
+    """Файл только для владельца: в ~/.claude.json учётная запись и настройки MCP-серверов с ключами."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def trust(folders, claude_json=None):
+    """«Yes, proceed» сразу для нескольких папок — так, как это записывает сам Claude Code. На время правки
+    берём его блокировку (папка <файл>.lock: занятую он ждёт). Ключ — путь с «/»: и как его видит исполнитель,
+    и настоящий путь на диске — по нему сверяет фоновая сессия. Возвращает путь копии файла до правки."""
+    path = claude_json or os.path.join(os.path.expanduser("~"), ".claude.json")
+    lock, deadline = path + ".lock", time.time() + CONFIG_LOCK_SEC
+    while True:
+        try:
+            os.mkdir(lock)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock) > 10:  # брошенная: так её считает и Claude Code
+                    os.rmdir(lock)
+            except OSError:
+                pass
+            if time.time() > deadline:
+                raise SystemExit(f"{path} занят другой программой — повторите позже") from None
+            time.sleep(0.1)
+    try:
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            data = json.loads(raw.decode("utf-8"))
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"{path} не прочитан: {e}") from None
+        projects = data.setdefault("projects", {})
+        for key in dict.fromkeys(fwd(p).rstrip("/") for f in folders for p in (f, os.path.realpath(f))):
+            projects[key] = {**projects.get(key, NEW_PROJECT), "hasTrustDialogAccepted": True}
+        backups = os.path.join(os.path.dirname(path), ".claude", "backups")
+        os.makedirs(backups, exist_ok=True)
+        backup = os.path.join(backups, f"{os.path.basename(path)}.before-trust-{dt.datetime.now():%Y%m%d-%H%M%S}")
+        write_private(backup, raw)
+        tmp = path + ".trust"
+        write_private(tmp, json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8"))  # как пишет Claude Code
+        for _ in range(50):
+            try:
+                os.replace(tmp, path)
+                return backup
+            except PermissionError:  # Windows: файл на миг открыт другой программой
+                time.sleep(0.1)
+        os.remove(tmp)
+        raise SystemExit(f"{path} держит другая программа — ничего не изменено")
+    finally:
+        os.rmdir(lock)
 
 
 def job_state(bg):
@@ -454,6 +516,19 @@ def cmd_statusline(path):
         print("Пульт")
 
 
+def folders_state(cfg, projects, claude_json=None):
+    """Проекты без папки на этом компьютере и папки, которым claude не доверяет: {папка: [проекты]};
+    у git-репо — его корень, доверие принимается там."""
+    missing, untrusted = [], {}
+    for p in projects:
+        folder = folder_for(cfg, {"project": p["id"], "project_path": p["path"]})
+        if not os.path.isdir(folder):
+            missing.append(p["id"])
+        elif not trusted(folder, claude_json):
+            untrusted.setdefault(git_root(folder) or folder, []).append(p["id"])
+    return missing, untrusted
+
+
 def cmd_check(cfg):
     cli = cfg["cli"]
     me = cli.request(cfg["pult"], "GET", "/api/me")["me"]
@@ -463,19 +538,37 @@ def cmd_check(cfg):
     print(f"claude: {out.strip() or 'не найден'}" + ("" if rc == 0 else f" (код {rc})"))
     print(f"папки проектов — от {cfg['base']}" + ("" if os.path.isdir(cfg["base"]) else " — ТАКОЙ ПАПКИ НЕТ"))
     st = cli.request(cfg["pult"], "GET", "/api/state")
-    missing, untrusted = [], {}
-    for p in st["projects"]:
-        folder = folder_for(cfg, {"project": p["id"], "project_path": p["path"]})
-        if not os.path.isdir(folder):
-            missing.append(p["id"])
-        elif not trusted(folder):
-            untrusted.setdefault(git_root(folder) or folder, []).append(p["id"])
+    missing, untrusted = folders_state(cfg, st["projects"])
     print(f"проектов {len(st['projects'])}, папки нет у {len(missing)}" + (f": {', '.join(missing)}" if missing else ""))
     if untrusted:
-        print(f"claude не доверяет {len(untrusted)} папкам — сессии там не запустятся. В каждой один раз: claude → "
-              f"«Yes, proceed» → /exit (у git-репо — в его корне):")
+        print(f"claude не доверяет {len(untrusted)} папкам — сессии там не запустятся. Доверить разом — "
+              f"pult_runner.py trust; или в каждой один раз: claude → «Yes, proceed» → /exit (у git-репо — в его корне):")
         for folder, ids in sorted(untrusted.items()):
             print(f"  {folder}  ← {', '.join(ids)}")
+
+
+def cmd_trust(cfg, yes, claude_json=None):
+    st = cfg["cli"].request(cfg["pult"], "GET", "/api/state")
+    untrusted = folders_state(cfg, st["projects"], claude_json)[1]
+    if not untrusted:
+        print("claude доверяет всем папкам проектов — делать нечего")
+        return
+    print(f"claude не доверяет {len(untrusted)} папкам (у git-репо — его корень):")
+    for folder, ids in sorted(untrusted.items()):
+        print(f"  {folder}  ← {', '.join(ids)}")
+    print("Доверить — то же, что «Yes, proceed» в каждой: в доверенной папке Claude Code без вопроса выполняет "
+          "команды из её настроек (хуки в .claude/settings.json). Доверяйте только своим папкам.")
+    try:
+        ok = yes or input("Доверить все? [y/N] ").strip().lower() in ("y", "yes", "д", "да")
+    except EOFError:  # без терминала — как «нет»
+        ok = False
+    if not ok:
+        print("ничего не изменено")
+        return
+    backup = trust(sorted(untrusted), claude_json)
+    left = [f for f in sorted(untrusted) if not trusted(f, claude_json)]
+    print(f"доверено папок: {len(untrusted) - len(left)}; копия файла до правки — {backup}"
+          + (f"; не записалось (файл переписала другая программа — повторите): {', '.join(left)}" if left else ""))
 
 
 def cmd_autostart(on):
@@ -506,6 +599,8 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("run")
     sub.add_parser("check")
+    tr = sub.add_parser("trust")
+    tr.add_argument("--yes", action="store_true")
     au = sub.add_parser("autostart")
     au.add_argument("state", choices=("on", "off"))
     sl = sub.add_parser("statusline")
@@ -518,6 +613,8 @@ def main(argv=None):
     cfg = load_cfg()
     if args.cmd == "check":
         return cmd_check(cfg)
+    if args.cmd == "trust":
+        return cmd_trust(cfg, args.yes)
     lock = socket.socket()
     try:
         lock.bind(("127.0.0.1", LOCK_PORT))

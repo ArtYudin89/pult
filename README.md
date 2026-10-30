@@ -130,6 +130,7 @@ sudo sh deploy/install.sh        # ставит службу, создаёт в�
 
 ```
 python pult_runner.py check            # адрес, ключ модели, программа claude, папки проектов
+python pult_runner.py trust            # доверить claude папки проектов разом — вместо «Yes, proceed» в каждой
 python pult_runner.py autostart on     # Windows: запуск при входе, без окна
 python pult_runner.py run              # или вручную
 ```

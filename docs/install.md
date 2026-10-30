@@ -203,7 +203,11 @@ sudo systemctl start pult-digest.service       # отправить сейчас
 2. `.local/runner.json`: `{"token_file": "claude-runner.token", "base": "C:\\work"}` — `base` — папка, от которой
    считается поле «папка» проекта; `folders` — свои папки для отдельных проектов. Адрес берётся из
    `.local/config.json`.
-3. `python pult_runner.py check` — адрес, ключ, `claude --version`, у каких проектов нет папки.
+3. `python pult_runner.py check` — адрес, ключ, `claude --version`, у каких проектов нет папки и каким папкам
+   claude не доверяет: там сессия не запустится. Доверить все разом — `python pult_runner.py trust`: покажет
+   список, спросит и запишет то же, что «Yes, proceed» в каждой (копия `~/.claude.json` до правки — в
+   `~/.claude/backups`). Доверяйте только своим папкам: в доверенной Claude Code без вопроса выполняет хуки из её
+   настроек.
 4. Windows: `python pult_runner.py autostart on` — ярлык в «Автозагрузке», запуск без окна. Linux и macOS —
    служба пользователя с `python3 pult_runner.py run`, как в разделе «Автозапуск» выше.
 
