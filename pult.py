@@ -555,7 +555,7 @@ def cmd_show(cfg, args):
         print("Описание:")
         for line in t["notes"].splitlines():
             print("  " + line)
-    if t["checklist"]:
+    if t.get("checklist"):  # сервер схемы 4–5 поля «Шаги» не отдаёт
         print("Шаги:")
         for i, c in enumerate(t["checklist"], 1):
             print(f"  {i}. [{'x' if c['on'] else ' '}] {c['t']}")
@@ -753,7 +753,7 @@ def op_step(cfg, key, action, arg):
     ver = seen(cfg).version(key) if by_number else None
     for attempt in (1, 2):
         t = request(cfg, "GET", f"/api/task/{q(key)}?journal=1")["task"]
-        items = [dict(c) for c in t["checklist"]]
+        items = [dict(c) for c in t.get("checklist", [])]
         if action == "add":
             items.append({"t": str(arg), "on": False})
         else:
