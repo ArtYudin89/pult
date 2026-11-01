@@ -7,9 +7,10 @@
     [slow]      работает, пока не остановят; каждый agents прибавляет 0,5% недели
     [block]     ждёт разрешения на компьютере
     [noauto]    то же, но на экране «auto mode unavailable for this model»
-    [stuck]     не дошла до работы: застряла на окне при запуске (доверие к папке)
+    [stuck]     не дошла до работы: застряла на окне при запуске (доверие к папке, серверы MCP проекта)
 Строку состояния пишет командой из --settings, как настоящий Claude Code, — так проверяется и
-pult_runner.py statusline. Все вызовы дописываются в FAKE_CLAUDE_DIR/calls.jsonl.
+pult_runner.py statusline; отклонённые там серверы MCP запоминает в записи сессии (disabled_mcp).
+Все вызовы дописываются в FAKE_CLAUDE_DIR/calls.jsonl.
 """
 import json
 import os
@@ -112,6 +113,7 @@ def main(argv):
              "kind": kind, "state": "blocked" if kind == "stuck" else "working", "started": time.time(),
              "week": 50.0, "prompt": prompt,
              "statusline": (settings.get("statusLine") or {}).get("command"),
+             "disabled_mcp": settings.get("disabledMcpjsonServers"),
              "transcript": os.path.join(DIR, sid + ".jsonl")}
         save(s)
         statusline(s)

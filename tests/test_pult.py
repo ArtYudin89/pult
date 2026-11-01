@@ -5,6 +5,7 @@
     python -X utf8 tests/test_pult.py -v
 """
 import contextlib
+import glob
 import hashlib
 import http.client
 import http.server
@@ -1569,6 +1570,48 @@ class Runs(Base):
         with open(os.path.join(bdir, os.listdir(bdir)[0]), "rb") as f:
             self.assertEqual(f.read(), raw, "копия — файл до правки")
 
+    def test_r9b_project_mcp(self):
+        """Серверы MCP проекта без ответа папки сессия отклоняет: иначе встанет на окне о них при запуске."""
+        r = self.runner_mod
+        base = os.path.join(self.tmp, "mcp")
+        proj = os.path.join(base, "proj")
+        os.makedirs(os.path.join(proj, ".claude"))
+        os.makedirs(os.path.join(base, ".claude"))
+
+        def put(path, data):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+
+        put(os.path.join(base, ".mcp.json"), {"mcpServers": {"a": {}, "b": {}}})
+        put(os.path.join(proj, ".mcp.json"), {"mcpServers": {"c": {}}})
+        self.assertEqual(r.unanswered_mcp(proj), ["a", "b", "c"], "и из папок выше")
+        put(os.path.join(proj, ".claude", "settings.local.json"), {"enabledMcpjsonServers": ["a"]})
+        put(os.path.join(proj, ".claude", "settings.json"), {"disabledMcpjsonServers": ["c"]})
+        put(os.path.join(base, ".claude", "settings.local.json"), {"enabledMcpjsonServers": ["b"]})
+        self.assertEqual(r.unanswered_mcp(proj), ["b"], "ответ папки выше не действует")
+        put(os.path.join(proj, ".claude", "settings.json"), {"enableAllProjectMcpServers": True})
+        self.assertEqual(r.unanswered_mcp(proj), [])
+
+        key = self.keys[3]
+        put(os.path.join(self.folder, ".mcp.json"), {"mcpServers": {"x": {}}})
+        try:
+            self.go(key, "[done] с серверами проекта")
+            runner = self.runner()
+            runner.tick()
+            with open(os.path.join(self.fake, runner.active["bg"] + ".json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["disabled_mcp"], ["x"])
+            self.drive(runner, (key, ("done",)))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                r.cmd_check({**self.rcfg, "engine": "claude"})
+            self.assertIn(f"  {self.folder}  ← lab: x", out.getvalue())
+            with unittest.mock.patch.object(r, "job_state", return_value={"detail": "1 new MCP servers need approval"}):
+                self.go(key, "[stuck] сделай")
+                st = self.drive(self.runner(), (key, ("failed",)))
+            self.assertIn("включать ли MCP-серверы проекта (1 new MCP servers need approval)", st["reason"])
+        finally:
+            os.remove(os.path.join(self.folder, ".mcp.json"))
+
     def test_r6_statusline_and_question_parsing(self):
         q = self.runner_mod.question_of
         self.assertEqual(q("Готово.\n**ВОПРОС:** какой цвет?"), "какой цвет?")
@@ -1581,6 +1624,86 @@ class Runs(Base):
         self.assertEqual(proc.stdout.decode("utf-8").strip(), "Пульт · W-1 · неделя 12.5%")
         with open(path, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["rate_limits"]["seven_day"]["used_percentage"], 12.5)
+
+    def test_r9_codex(self):
+        """Исполнитель Codex: exec --json, вопрос и продолжение resume, своя модель, остановка, время, перезапуск."""
+        r = self.runner_mod
+        self.api("POST", "/api/actor", {"id": "cxr", "name": "Codex", "kind": "model", "owner": "artem"}, who="artem")
+        token = self.api("POST", "/api/actor/cxr/key", {"label": "cxr-runner"}, who="artem")["token"]
+        fake = os.path.join(self.tmp, "fake_codex")
+        cfg = dict(self.rcfg, engine="codex", pult={"url": self.url, "token": token, "session": ""},
+                   codex=[sys.executable, "-X", "utf8", os.path.join(ROOT, "tests", "fake_codex.py")])
+        key, key2 = self.keys[6], self.keys[7]
+
+        def calls():
+            with open(os.path.join(fake, "calls.jsonl"), encoding="utf-8") as f:
+                return [json.loads(line) for line in f]
+
+        with unittest.mock.patch.dict(os.environ, {"FAKE_CODEX_DIR": fake}):
+            runner = r.CodexRunner(cfg)
+            runner.tick(hello=True)
+            self.go(key, "[question] выбери цвет", executor="cxr", model="claude-opus-5-5", effort="max")
+            asked = self.drive(runner, (key, ("asked",)))
+            self.assertEqual(asked["question"], "Какого цвета кнопка?")
+            self.assertTrue(asked["session"] and asked["bg"].startswith("codex:") and asked["folder"] == self.folder)
+            c = calls()[-1]
+            argv = c["argv"]
+            self.assertEqual(os.path.normcase(c["cwd"]), os.path.normcase(self.folder))
+            self.assertEqual((argv[0], argv[-1]), ("exec", "-"), "поручение — со стандартного ввода")
+            self.assertNotIn("-m", argv, "модель Claude Codex не передаётся")
+            for opt in ('model_reasoning_effort="xhigh"', 'approval_policy="never"', "--json"):
+                self.assertIn(opt, argv)
+            self.assertIn(f"show {key}", c["prompt"])
+            self.assertIn("ВОПРОС:", c["prompt"])
+            self.assertIn("Предел запуска:", c["prompt"])
+            self.assertFalse(glob.glob(os.path.join(r.WORK, f"run-{asked['id']}.*")), "файлы сессии убраны")
+            self.api("POST", f"/api/run/{asked['id']}/reply", {"message": "синий [done]"}, who="artem")
+            done = self.drive(runner, (key, ("done",)))
+            c = calls()[-1]
+            self.assertEqual(c["argv"][:3], ["exec", "resume", asked["session"]])
+            self.assertTrue(c["prompt"].startswith("Ответ от Артём:\n\nсиний [done]"))
+            self.assertEqual(done["session"], asked["session"])
+            self.assertIn("Сделано: поле добавлено", done["result"])
+
+            self.go(key2, "[done] своя модель", executor="cxr", model="gpt-6-luna", effort="high")
+            self.drive(runner, (key2, ("done",)))
+            argv = calls()[-1]["argv"]
+            self.assertEqual(argv[argv.index("-m") + 1], "gpt-6-luna")
+            self.assertIn('model_reasoning_effort="high"', argv)
+
+            self.go(key, "[fail] сорвётся", executor="cxr")
+            st = self.drive(runner, (key, ("failed",)))
+            self.assertEqual(st["reason"], "codex: stream disconnected before completion")
+
+            self.go(key, "[slow] долго", executor="cxr")
+            runner.tick()
+            st = self.run_of(key)
+            self.assertEqual(st["status"], "working")
+            pid = int(st["bg"][6:])
+            second = r.CodexRunner(cfg)  # исполнитель перезапустили: процесс codex ещё идёт
+            second.tick(hello=True)
+            self.assertEqual((second.active["run"]["id"], second.active["pid"]), (st["id"], pid))
+            self.api("POST", f"/api/run/{st['id']}/stop", {}, who="artem")
+            st = self.drive(second, (key, ("stopped",)))
+            self.assertEqual(st["reason"], "остановлена по просьбе человека")
+            self.assertFalse(r.pid_alive(pid), "процесс codex снят")
+            runner.active["proc"].wait(10)  # первый исполнитель «умер», не дождавшись своего процесса
+
+            self.go(key, "[slow] до предела", executor="cxr", minutes=1)
+            runner = r.CodexRunner(cfg)
+            runner.tick()
+            runner.active["started"] -= 61
+            st = self.drive(runner, (key, ("stopped",)))
+            self.assertEqual(st["reason"], "вышло время — 1 мин")
+
+            self.go(key, "[slow] пропадёт", executor="cxr")
+            runner.tick()
+            r.kill_tree(runner.active["pid"])
+            runner.active["proc"].wait(10)
+            third = r.CodexRunner(cfg)
+            third.tick(hello=True)
+            st = self.run_of(key)
+            self.assertEqual((st["status"], st["reason"]), ("failed", "исполнитель перезапускался, сессии уже нет"))
 
 
 class Tls(Base):

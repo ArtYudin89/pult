@@ -344,8 +344,10 @@ try:
         page.wait_for_selector('#drawer form[data-form="run"]')
         msg = page.input_value('#drawer form[data-form="run"] textarea[name="message"]')
         check(msg == "Проверь доску на телефоне и запиши, что неудобно", f"окно подставило сообщение для ИИ ({msg[:30]!r})")
-        check(page.input_value('#drawer input[name="budget"]') == "3" and page.input_value('#drawer input[name="minutes"]') == "60",
-              "пределы по умолчанию: 3% недели и 60 минут")
+        lim = call("GET", "/api/state")["ai"]  # на копии боевой базы — свои пределы, не 3% и 60 минут
+        want = (f"{lim['budget']:g}".replace(".", ","), str(lim["minutes"]))
+        check((page.input_value('#drawer input[name="budget"]'), page.input_value('#drawer input[name="minutes"]')) == want,
+              f"пределы по умолчанию — из настроек Пульта: {want[0]}% недели и {want[1]} минут")
         check(page.input_value('#drawer form[data-form="run"] input[name="effort"]') == "low", "усилие подставлено из карточки")
         week = page.locator("#run-week").inner_text()
         check("исполнитель" in week and "потолок 80%" in week, f"строка про исполнителя и неделю: {week!r}")
@@ -379,7 +381,7 @@ try:
         dp.wait_for_selector(".bcol")
         dp.screenshot(path=os.path.join(out, "06_board_dark.png"))
         dp.goto(base + "/#board&t=INF-30")
-        dp.wait_for_selector("#drawer .thumb img")
+        dp.wait_for_selector("#drawer .thumb img", state="attached")  # у вложений копии базы нет файлов
         dp.wait_for_timeout(300)
         dp.screenshot(path=os.path.join(out, "07_card_dark.png"))
 
@@ -416,10 +418,18 @@ try:
         after = pp.evaluate("document.getElementById('board').scrollLeft")
         check(task(k3)["status"] == "inbox" and pp.locator(".bghost").count() == 0,
               f"телефон: быстрый свайп не переносит карточку (прокрутка {before}→{after})")
-        pp.evaluate("document.getElementById('board').scrollLeft = 0")
-        pp.wait_for_timeout(300)
+        # доска после свайпа ещё докручивается до колонки и перебивает прокрутку из кода — ставить, пока не встанет
+        left, steady = None, 0
+        for _ in range(40):
+            pp.evaluate("document.getElementById('board').scrollLeft = 0")
+            pp.wait_for_timeout(100)
+            left = pp.evaluate("document.getElementById('board').scrollLeft")
+            steady = steady + 1 if left == 0 else 0
+            if steady == 3:
+                break
         # долгое нажатие и перенос в соседнюю колонку
         x0, y0 = center(first.bounding_box())
+        check(left == 0 and 0 < x0 < 400, f"телефон: доска вернулась к «Входящим» (прокрутка {left}, карточка x={x0:.0f})")
         touch("touchStart", x0, y0)
         pp.wait_for_timeout(600)
         lifted = pp.locator(".bghost").count() == 1
