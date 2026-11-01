@@ -413,6 +413,13 @@ class PlainHttp(Base):
         self.assertTrue(self.api("GET", "/api/task/1C-1")["task"]["checklist"][2]["on"])
         done = self.api("GET", "/api/task/SR-3")["task"]
         self.assertEqual((done["status"], done["next"]), ("done", "сделано пакетом"))
+        with open(pf, "w", encoding="utf-8") as f:
+            json.dump([{"op": "step", "key": "SR-4", "add": {"t": "три", "on": True}},
+                       {"op": "step", "key": "SR-4", "add": {"text": "без t"}}], f, ensure_ascii=False)
+        rc, out = run("apply", pf)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("выполнено 1 из 2", out)
+        self.assertEqual(self.api("GET", "/api/task/SR-4")["task"]["checklist"][2], {"t": "три", "on": True})
         for argv, needle in ((("brief",), "Пульт ·"), (("ls", "--project", "lab"), "SR-1"),
                              (("find", "конвейер"), "1C-1"), (("find", "1С-1"), "1C-1"),
                              (("show", "SR-1"), "Журнал"), (("show", "1C-1"), "3. [x] влить"),

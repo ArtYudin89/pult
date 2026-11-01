@@ -758,7 +758,7 @@ def op_step(cfg, key, action, arg):
         t = request(cfg, "GET", f"/api/task/{q(key)}?journal=1")["task"]
         items = [dict(c) for c in t.get("checklist", [])]
         if action == "add":
-            items.append({"t": str(arg), "on": False})
+            items.append(new_step(arg))
         else:
             idx = resolve_step(items, arg)
             if action == "check":
@@ -780,6 +780,15 @@ def op_step(cfg, key, action, arg):
             if attempt == 2:
                 raise
     raise AssertionError("unreachable")
+
+
+def new_step(arg):
+    """Шаг для add — как пункт checklist: строка или {"t": текст, "on": сделан}."""
+    if isinstance(arg, str) and arg.strip():
+        return {"t": arg, "on": False}
+    if isinstance(arg, dict) and isinstance(arg.get("t"), str) and arg["t"].strip():
+        return {"t": arg["t"], "on": bool(arg.get("on"))}
+    raise ValueError(f"step add: нужен текст шага или {{\"t\": текст, \"on\": true}}, а не {arg!r}")
 
 
 def resolve_step(items, arg):
