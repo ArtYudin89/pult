@@ -708,6 +708,17 @@ class Concurrency(Base):
         rc, out = self.run_cli("done", key, "--result", "закрыто после show", **env)
         self.assertEqual(rc, 0, "после show знание свежее: " + out)
 
+    def test_c5b_codex_thread_label(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("PULT_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")}
+        env.update(PULT_URL="http://x", PULT_TOKEN="t", CODEX_THREAD_ID="01a1972e-184f-7c93-85e5-d07e5db6fed9")
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(cli.load_config()["session"], "codex-5db6fed9", "конец id Codex: начало — время")
+            os.environ["CLAUDE_CODE_SESSION_ID"] = "4e237d31-aaaa"
+            self.assertEqual(cli.load_config()["session"], "4e237d31", "метка Claude главнее")
+            os.environ["PULT_SESSION"] = ""
+            self.assertEqual(cli.load_config()["session"], "", "пустая PULT_SESSION выключает метку")
+
     def test_c6_apply_from_two_sessions(self):
         key = self.keys[0]
         self.run_cli("brief", PULT_SESSION="pack-a")

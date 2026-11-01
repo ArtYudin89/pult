@@ -40,7 +40,7 @@
 Даты: 27.10, 27.10.2026, 2026-10-27, +3 (дней), +2w, сегодня, завтра; «-» — убрать значение.
 
 Одновременная правка. Сессия помечается PULT_SESSION, а в Claude Code — первыми знаками CLAUDE_CODE_SESSION_ID,
-и запоминает в .local/seen/, какими видела карточки: первое чтение Пульта — все задачи, show — открытую
+в Codex — «codex-» и последними знаками CODEX_THREAD_ID, и запоминает в .local/seen/, какими видела карточки: первое чтение Пульта — все задачи, show — открытую
 карточку. set, done, delete и шаг по номеру уходят с этой версией: если с тех пор другие поменяли те же
 поля, сервер не затрёт их правку, а pult.py покажет, что изменилось. Правки других полей сливаются сами.
 """
@@ -123,6 +123,9 @@ def load_config():
     session = os.environ.get("PULT_SESSION")
     if session is None:
         session = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "")[:8]
+        if not session and os.environ.get("CODEX_THREAD_ID"):
+            # id чата Codex — UUIDv7: начало — время, у чатов одной минуты оно общее; берём конец
+            session = "codex-" + os.environ["CODEX_THREAD_ID"].replace("-", "")[-8:]
     cfg["session"] = session if SESSION_RE.match(session) else ""
     cfg["seen_dir"] = os.environ.get("PULT_SEEN_DIR") or os.path.join(LOCAL, "seen")
     return cfg
