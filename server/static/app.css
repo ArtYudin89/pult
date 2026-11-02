@@ -242,10 +242,19 @@ mark{background:var(--hl);color:inherit;border-radius:3px;padding:0 1px}
 .picker{display:flex;flex-wrap:wrap;gap:6px;padding:8px;border-radius:10px;background:var(--sunken)}
 .comment{display:grid;gap:8px}
 
-/* выдвижная карточка */
+/* карточка: справа, по центру или на весь экран */
 .scrim{position:fixed;inset:0;z-index:20;background:var(--scrim)}
 .drawer{position:fixed;top:0;right:0;bottom:0;z-index:21;width:min(560px,100%);overflow-y:auto;overscroll-behavior:contain;background:var(--surface);border-left:1px solid var(--line);box-shadow:var(--shadow);padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);padding-right:env(safe-area-inset-right,0px)}
+.drawer[data-card-layout="center"]{inset:32px 0;width:min(880px,calc(100% - 64px));margin-inline:auto;border:1px solid var(--line);border-radius:14px}
+.drawer[data-card-layout="full"]{inset:0;width:100%;border:0;border-radius:0;padding-left:env(safe-area-inset-left,0px)}
+.drawer[data-card-layout="full"] .task{width:100%;max-width:1200px;margin-inline:auto}
 .drawer-close{position:sticky;top:0;z-index:1;display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 12px 8px 22px;background:var(--surface)}
+.drawer-tools{display:flex;align-items:center;gap:12px}
+.drawer-layout{display:flex;gap:2px;padding:2px;border:1px solid var(--line);border-radius:10px;background:var(--sunken)}
+.drawer-layout .xbtn{border:0;background:none;color:var(--muted)}
+.drawer-layout .xbtn:hover{background:var(--surface);color:var(--ink)}
+.drawer-layout .xbtn[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent)}
+.drawer-layout svg{fill:none;stroke:currentColor;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}
 .xbtn{display:grid;place-items:center;width:32px;height:32px;border:1px solid var(--line);border-radius:8px;background:var(--surface);cursor:pointer}
 .xbtn svg{width:14px;height:14px}
 
@@ -415,6 +424,8 @@ details.f[open] summary{margin-bottom:6px}
   .trow .dslot{grid-area:dt;justify-content:flex-start}
   .trow .av{grid-area:av}
   .task{padding:4px 16px 24px}
+  .drawer[data-card-layout]{inset:0;width:100%;border:0;border-radius:0;padding-left:env(safe-area-inset-left,0px)}
+  .drawer-layout{display:none}
   .drawer-close{padding-left:16px}
   .fields{grid-template-columns:100px minmax(0,1fr)}
   .row2,.row3{grid-template-columns:minmax(0,1fr)}

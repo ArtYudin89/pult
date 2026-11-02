@@ -1,5 +1,5 @@
 "use strict";
-// Пульт: главная как в макете 2 (слева разделы и проекты, справа задачи), карточка задачи справа.
+// Пульт: главная как в макете 2 (слева разделы и проекты, справа задачи), карточка в выбранном виде.
 // Данные — /api/state целиком (без описаний), карточка — /api/task/<номер> с журналом и вложениями,
 // участники — /api/people (владельцу все, участнику он сам и его модели). Доска — те же задачи
 // колонками по статусам: карточку перетаскивают в другую колонку (на телефоне — после долгого нажатия).
@@ -1021,11 +1021,25 @@
 
   // ---------- карточка задачи ----------
 
-  const drawerHead = key => '<div class="drawer-close"><span class="tid">' + esc(key) + '</span><button class="xbtn" type="button" data-close aria-label="Закрыть карточку">' + XICON + '</button></div>';
+  const DRAWER_LAYOUTS = [
+    ["side", "Справа", '<rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M10 2v12"/>'],
+    ["center", "По центру", '<rect x="2" y="2" width="12" height="12" rx="1.5"/><rect x="5" y="4.5" width="6" height="7" rx=".5"/>'],
+    ["full", "На весь экран", '<path d="M6 2H2v4m8-4h4v4M2 10v4h4m8-4v4h-4"/>']
+  ];
+  let drawerLayout = "center";
+  try {
+    const saved = localStorage.getItem("pult.cardLayout");
+    if (DRAWER_LAYOUTS.some(([value]) => value === saved)) drawerLayout = saved;
+  } catch (_) { /* В браузере может быть запрещено хранение настроек. */ }
+
+  const drawerHead = key => '<div class="drawer-close"><span class="tid">' + esc(key) + '</span><div class="drawer-tools"><div class="drawer-layout" role="group" aria-label="Вид карточки">' +
+    DRAWER_LAYOUTS.map(([value, label, icon]) => '<button class="xbtn" type="button" data-layout="' + value + '" title="' + label + '" aria-label="' + label + '" aria-pressed="' + (drawerLayout === value) + '"><svg viewBox="0 0 16 16" aria-hidden="true">' + icon + '</svg></button>').join("") +
+    '</div><button class="xbtn" type="button" data-close aria-label="Закрыть карточку">' + XICON + '</button></div></div>';
 
   function showDrawer(html, label) {
     const d = $("drawer");
     if (d.hidden) lastFocus = document.activeElement;
+    d.dataset.cardLayout = drawerLayout;
     d.setAttribute("aria-label", label || "Карточка задачи");
     d.innerHTML = html;
     d.hidden = false;
@@ -1349,7 +1363,7 @@
   // ---------- события ----------
 
   const CLICKS = "[data-nav],[data-task],[data-close],[data-reset],[data-more-closed],[data-status],[data-take],[data-pass],[data-holder],[data-edit],[data-cancel],[data-step],[data-copy],[data-del],[data-addrow],[data-rmrow],[data-aiedit],[data-aicancel],[data-run],[data-askonly],[data-askclear],[data-runstop],[data-tglink],[data-tgunlink],[data-logactor],[data-new],[data-me],[data-logout]," +
-    "[data-person],[data-pnew],[data-ungrant],[data-role],[data-revoke-key],[data-revoke-invite],[data-copy-secret],[data-pedit],[data-active],[data-addgrant],[data-board],[data-attach],[data-fdel]";
+    "[data-person],[data-pnew],[data-ungrant],[data-role],[data-revoke-key],[data-revoke-invite],[data-copy-secret],[data-pedit],[data-active],[data-addgrant],[data-board],[data-attach],[data-fdel],[data-layout]";
 
   document.addEventListener("click", ev => {
     if (suppressClick > Date.now()) { suppressClick = 0; ev.preventDefault(); return; }  // щелчок в конце перетаскивания
@@ -1378,6 +1392,11 @@
       location.hash = hashFor(route, d.task);
     } else if (d.close !== undefined) {
       closeTask();
+    } else if (d.layout !== undefined) {
+      drawerLayout = d.layout;
+      $("drawer").dataset.cardLayout = drawerLayout;
+      $("drawer").querySelectorAll("[data-layout]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.layout === drawerLayout)));
+      try { localStorage.setItem("pult.cardLayout", drawerLayout); } catch (_) { /* Выбор действует до закрытия страницы. */ }
     } else if (d.reset !== undefined) {
       $("q").value = ""; query = ""; renderMain(); $("q").focus();
     } else if (d.moreClosed !== undefined) {
